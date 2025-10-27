@@ -316,7 +316,7 @@ echo "gsp_vial_metrics" > .python-version
 - ✅ Scatter plots with no connecting lines
 - ✅ Proper vial name extraction for compressed files
 - ✅ Error handling for empty mrstats output
-- ✅ T1/T2 curve fitting with 95% CI
+- ✅ T1/T2 curve fitting with R² goodness-of-fit metrics
 
 ### Key Fixes Applied
 
