@@ -1,569 +1,349 @@
-# Phantom Vial Metrics Pipeline Specification
+# GSP Vial Metrics - Pydra Pipeline
 
-**Version:** 1.0  
-**Date:** October 2024  
-**Author:** Arkiev D'Souza
+Automated phantom analysis pipeline for MRI quality control using Pydra workflow management.
 
----
+## Quick Start
 
-## 1. Overview
+### 1. Initial Setup
 
-### 1.1 Purpose
-Automated computation of vial-based metrics from phantom MRI scans using registration, segmentation, and quantitative analysis.
+```bash
+# Make setup script executable
+chmod +x setup_environment.sh
 
-### 1.2 Scope
-- **Input:** NIfTI format phantom MRI images (T1, T2, IR, multi-contrast)
-- **Output:** CSV metrics files, visualization plots, registered segmentations
-- **Platform:** Docker containerized, Pydra workflow management
-- **Deployment:** Local execution, HPC-ready
-
-### 1.3 Key Features
-- Automated rigid-body registration to template
-- Multi-contrast support with automatic detection
-- Vial-based ROI analysis (mean, median, std, min, max)
-- Parallel batch processing
-- Session-based organization
-- Workflow caching and resumability
-
----
-
-## 2. Pipeline Architecture
-
-### 2.1 High-Level Workflow
-
-```
-┌─────────────────┐
-│  Input Images   │
-│  (NIfTI files)  │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Registration   │◄─── Template Phantom
-│  to Template    │◄─── Rotation Library (120 transforms)
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Orientation    │
-│  Validation     │◄─── QC Checks (vial intensities)
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Apply Transform │
-│  to Vial ROIs   │◄─── Template Vial Segmentations
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Extract Metrics │
-│  Per Vial       │◄─── All contrasts in session
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Generate Plots │
-│  & Reports      │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Output Files   │
-│  (CSV + PNG)    │
-└─────────────────┘
+# Run setup script
+./setup_environment.sh
 ```
 
-### 2.2 Component Breakdown
+This will:
+- Set up Python 3.13.7 with pyenv
+- Create virtual environment `gsp_vial_metrics`
+- Install all Python dependencies
+- Check for external tool dependencies (ANTs, MRtrix3)
 
-#### 2.2.1 Registration Module
-- **Tool:** ANTs (antsRegistrationSyN.sh)
-- **Type:** Rigid body (rotation only, no scaling/shearing)
-- **Iterations:** Up to 120 (rotation library search)
-- **Success Criteria:** 
-  - High-intensity vials (A, O, Q) in top 5
-  - Low-intensity vials (S, D, P) in bottom 5
-  - Vial standard deviation < 50
+### 2. Manual Activation (if needed)
 
-#### 2.2.2 Segmentation Module
-- **Input:** Template vial masks (pre-labeled)
-- **Process:** Inverse transform from template → subject space
-- **Output:** Subject-space vial ROIs (one per vial)
+The environment should activate automatically when you `cd` into this directory. If not:
 
-#### 2.2.3 Metrics Extraction Module
-- **Tool:** MRtrix3 (mrstats)
-- **Metrics:** mean, median, std, min, max
-- **Per:** Each vial × each contrast × each volume
-- **Output Format:** CSV matrices
+```bash
+pyenv activate gsp_vial_metrics
+```
 
-#### 2.2.4 Visualization Module
-- **Tool:** Python (matplotlib, seaborn)
-- **Outputs:**
-  - Scatter plots with error bars (mean ± std)
-  - ROI overlay screenshots (MRView)
-  - Parametric maps (T1, T2) if applicable
+### 3. Run Pipeline
+
+```bash
+python pydra_phantom_iterative.py single \
+    /path/to/your/t1_mprage.nii.gz \
+    --template-dir /path/to/TemplateData \
+    --output-dir /path/to/Outputs \
+    --rotation-lib /path/to/TemplateData/rotations.txt
+```
 
 ---
 
-## 3. Data Specifications
+## Repository Structure
 
-### 3.1 Input Requirements
+```
+GSP_vial_metrics_pydra/
+├── pydra_phantom_iterative.py    # Main processing script
+├── plot_maps_ir.py                # T1 inversion recovery plotting
+├── plot_maps_TE.py                # T2 echo time plotting
+├── Functions/
+│   └── plot_vial_intensity.py    # Individual contrast plotting
+├── setup_environment.sh           # Environment setup script
+├── requirements.txt               # Python dependencies
+├── .python-version                # Auto-activates environment
+└── README.md                      # This file
+```
 
-#### 3.1.1 Directory Structure
+---
+
+## Dependencies
+
+### Python Packages (installed by setup script)
+- `numpy` - Numerical computing
+- `pandas` - Data manipulation
+- `matplotlib` - Plotting
+- `scipy` - Scientific computing (curve fitting)
+- `pydra` - Workflow management
+
+### External Tools (must be installed separately)
+
+#### ANTs (Advanced Normalization Tools)
+**Purpose:** Image registration
+
+**Installation:**
+```bash
+# macOS
+brew install ants
+
+# Or download from: https://github.com/ANTsX/ANTs/releases
+```
+
+**Required commands:**
+- `antsRegistrationSyN.sh`
+
+#### MRtrix3
+**Purpose:** Image processing and manipulation
+
+**Installation:**
+```bash
+# macOS
+brew install mrtrix3
+
+# Or download from: https://www.mrtrix.org/download/
+```
+
+**Required commands:**
+- `mrinfo` - Image information
+- `mrconvert` - Format conversion
+- `mrgrid` - Image regridding
+- `mrstats` - Image statistics
+- `mrtransform` - Image transformation
+- `mrcat` - Concatenate images
+- `mrmath` - Image mathematics
+- `mrview` - Image visualization (optional, for QC)
+
+---
+
+## Usage
+
+### Single Session Processing
+
+Process one phantom session:
+
+```bash
+python pydra_phantom_iterative.py single \
+    /path/to/t1_mprage.nii.gz \
+    --template-dir /path/to/TemplateData \
+    --output-dir /path/to/Outputs \
+    --rotation-lib /path/to/TemplateData/rotations.txt
+```
+
+**Arguments:**
+- `input_image` - Path to primary T1 MPRAGE image
+- `--template-dir` - Directory containing:
+  - `ImageTemplate.nii.gz` - Template phantom image
+  - `VialsLabelled/` - Directory with vial masks (A.nii.gz, B.nii.gz, etc.)
+  - `rotations.txt` - Rotation library file
+- `--output-dir` - Output directory for results
+- `--rotation-lib` - Path to rotations.txt file
+
+### Batch Processing
+
+Process multiple sessions in parallel:
+
+```bash
+python pydra_phantom_iterative.py batch \
+    /path/to/data/directory \
+    --template-dir /path/to/TemplateData \
+    --output-dir /path/to/Outputs \
+    --rotation-lib /path/to/TemplateData/rotations.txt \
+    --pattern '*t1*mprage*.nii.gz' \
+    --plugin cf
+```
+
+**Additional arguments:**
+- `data_dir` - Directory containing session subdirectories
+- `--pattern` - Glob pattern to find T1 images (default: `*t1*mprage*.nii.gz`)
+- `--plugin` - Pydra execution plugin: `cf` (concurrent) or `serial`
+
+---
+
+## Expected Data Structure
+
+### Input Data
 ```
 Data/
-└── SessionName/          # Session identifier
-    ├── scan1.nii.gz      # Primary phantom scan (T1, T2, etc.)
-    ├── scan2.nii.gz      # Additional contrasts
+├── Session1/
+│   ├── t1_mprage_sag.nii.gz       # Primary input (T1-weighted)
+│   ├── se_ir_100.nii.gz           # Inversion recovery (100ms TI)
+│   ├── se_ir_250.nii.gz           # Inversion recovery (250ms TI)
+│   ├── se_ir_500.nii.gz           # etc.
+│   ├── t2_se_TE_14.nii.gz         # Spin echo (14ms TE)
+│   ├── t2_se_TE_20.nii.gz         # Spin echo (20ms TE)
+│   └── ...
+└── Session2/
     └── ...
 ```
 
-#### 3.1.2 File Formats
-- **Required:** NIfTI (.nii or .nii.gz)
-- **Orientation:** Any (automatic detection and correction)
-- **Dimensions:** 3D or 4D (multi-volume support)
-- **Voxel Size:** Any (template resampling applied)
-
-#### 3.1.3 Naming Conventions
-- **T1-weighted:** Pattern matching `*t1*mprage*` (case-insensitive)
-- **Inversion Recovery:** Pattern matching `*ir*`
-- **T2/TE mapping:** Pattern matching `*TE*`
-- **Flexible:** User-definable patterns
-
-### 3.2 Output Specifications
-
-#### 3.2.1 Directory Structure
+### Template Data
 ```
-output_directory/
+TemplateData/
+├── ImageTemplate.nii.gz           # Template phantom image
+├── VialsLabelled/                 # Vial ROI masks
+│   ├── A.nii.gz
+│   ├── B.nii.gz
+│   ├── C.nii.gz
+│   └── ... (through T.nii.gz)
+└── rotations.txt                  # Rotation matrix library
+```
+
+**Note:** Vial masks must be `.nii.gz` format (compressed NIfTI)
+
+---
+
+## Output Structure
+
+```
+Outputs/
 └── SessionName/
-    ├── metrics/
-    │   ├── SessionName_scan1_mean_matrix.csv
-    │   ├── SessionName_scan1_median_matrix.csv
-    │   ├── SessionName_scan1_std_matrix.csv
-    │   ├── SessionName_scan1_min_matrix.csv
-    │   ├── SessionName_scan1_max_matrix.csv
-    │   ├── SessionName_scan1_PLOTmeanstd.png
+    ├── metrics/                           # Extracted metrics
+    │   ├── SessionName_contrast_mean_matrix.csv
+    │   ├── SessionName_contrast_std_matrix.csv
+    │   ├── SessionName_contrast_PLOTmeanstd.png
     │   ├── SessionName_ir_map_PLOTmeanstd_TEmapping.png
+    │   ├── SessionName_ir_map_PLOTmeanstd_TEmapping_T1_fits.csv
+    │   ├── SessionName_TE_map_PLOTmeanstd_TEmapping.png
+    │   └── SessionName_TE_map_PLOTmeanstd_TEmapping_T2_fits.csv
+    ├── vial_segmentations/                # Transformed vial masks
+    │   ├── A.nii.gz
+    │   ├── B.nii.gz
     │   └── ...
-    ├── vial_segmentations/
-    │   ├── VialA.nii.gz
-    │   ├── VialB.nii.gz
-    │   └── ...
-    └── TemplatePhantom_ScannerSpace.nii.gz
+    └── TemplatePhantom_ScannerSpace.nii.gz  # Template in subject space
 ```
 
-#### 3.2.2 CSV Format
-```csv
-vial,scan_vol0,scan_vol1,...
-VialA,1234.5,1245.2,...
-VialB,987.3,992.1,...
-...
-```
+### Output Files
 
-- **Row 1:** Header (vial, contrast_vol0, contrast_vol1, ...)
-- **Column 1:** Vial identifier
-- **Columns 2+:** Metric values per volume
+**Metrics CSVs:**
+- `*_mean_matrix.csv` - Mean intensity per vial per timepoint
+- `*_std_matrix.csv` - Standard deviation per vial per timepoint
+- `*_T1_fits.csv` - Fitted T1 values per vial (S0, T1_ms, R2)
+- `*_T2_fits.csv` - Fitted T2 values per vial (S0, T2_ms, R2)
 
-#### 3.2.3 Image Outputs
-- **Format:** PNG (plots), NIfTI (segmentations)
-- **Resolution:** 300 DPI (plots)
-- **Color scheme:** Red ROI overlays, customizable plots
+**Plots:**
+- `*_PLOTmeanstd.png` - Individual contrast plots (scatter + error bars)
+- `*_ir_map_PLOTmeanstd_TEmapping.png` - T1 parametric maps with fitted curves
+- `*_TE_map_PLOTmeanstd_TEmapping.png` - T2 parametric maps with fitted curves
 
 ---
 
-## 4. Execution Modes
+## Pipeline Overview
 
-### 4.1 Single Session Mode (pydra_basic.py)
+### Processing Steps
 
-**Purpose:** Process one phantom scan
+1. **Registration with Orientation Correction**
+   - Registers input T1 image to template
+   - Iteratively tests rotation matrices if needed
+   - Validates registration quality
 
-**Usage:**
-```python
-python .vscode/pydra_basic.py
+2. **Vial Transformation**
+   - Transforms vial masks from template to subject space
+   - Applies registration + rotation transforms
+
+3. **Metric Extraction**
+   - Extracts mean, std, min, max, median for each vial
+   - Processes all contrast images in session
+
+4. **Plot Generation**
+   - Individual contrast plots (scatter with error bars)
+   - T1 parametric maps (inversion recovery fitting)
+   - T2 parametric maps (exponential decay fitting)
+
+### Fitting Models
+
+**T1 (Inversion Recovery):**
+```
+S(TI) = |S₀ · (1 - 2 · exp(-TI/T₁))|
 ```
 
-**Configuration:**
-```python
-input_image = "/path/to/Session/scan.nii.gz"
-output_dir = "test_output"
+**T2 (Spin Echo):**
 ```
-
-**Execution Flow:**
-1. Load input image path
-2. Validate file exists
-3. Create Pydra task
-4. Execute Docker container
-5. Return results
-
-**Performance:**
-- **Time:** ~5-15 minutes per session
-- **Memory:** ~4 GB
-- **CPU:** 8 threads (ANTs)
+S(TE) = S₀ · exp(-TE/T₂)
+```
 
 ---
 
-### 4.2 Batch Mode (pydra_batch.py)
+## Troubleshooting
 
-**Purpose:** Process multiple sessions in parallel
+### Environment Issues
 
-**Usage:**
+**Problem:** `pyenv: python: command not found`
+
+**Solution:** Run setup script or manually activate:
 ```bash
-python .vscode/pydra_batch.py \
-    /path/to/Data \
-    ./batch_output \
-    --pattern "*t1*mprage*.nii.gz" \
-    --n-procs 4
+./setup_environment.sh
+# OR
+pyenv activate gsp_vial_metrics
 ```
-
-**Parameters:**
-- `data_dir`: Root directory containing session folders
-- `output_dir`: Base output directory
-- `--pattern`: Glob pattern for finding input images (default: `*t1*mprage*.nii.gz`)
-- `--n-procs`: Number of parallel processes (default: 2)
-
-**Execution Flow:**
-1. Scan data directory for matching images
-2. Create task list
-3. Execute tasks in parallel (ProcessPoolExecutor)
-4. Collect results
-5. Report successes/failures
-
-**Performance:**
-- **Time:** ~5-15 min per session ÷ n_procs
-- **Memory:** ~4 GB × n_procs
-- **Parallelization:** Process-based (isolated containers)
 
 ---
 
-### 4.3 Pipeline Mode (pydra_advanced.py)
+**Problem:** Environment doesn't auto-activate
 
-**Purpose:** Advanced workflow management with caching
-
-**Usage:**
+**Solution:** Ensure `.python-version` exists:
 ```bash
-python .vscode/pydra_advanced.py \
-    /path/to/Data \
-    ./pipeline_output \
-    --pattern "Subject*" \
-    --plugin cf \
-    --n-procs 4
-```
-
-**Parameters:**
-- `data_dir`: Root directory
-- `output_dir`: Output directory
-- `--pattern`: Session directory pattern (default: `*`)
-- `--plugin`: Pydra plugin (cf=concurrent futures, serial)
-- `--n-procs`: Parallel workers
-
-**Features:**
-- **Caching:** Completed sessions not reprocessed
-- **Resumability:** Can restart after interruption
-- **Extensible:** Class-based for adding custom steps
-- **Workflow tracking:** Detailed logs and provenance
-
-**Execution Flow:**
-1. Initialize PhantomPipeline class
-2. Scan for sessions matching pattern
-3. Check cache for completed sessions
-4. Create tasks for remaining sessions
-5. Execute with Pydra workflow engine
-6. Store results in cache
-7. Generate summary report
-
-**Performance:**
-- **Time:** ~5-15 min per new session
-- **Memory:** ~4 GB × n_procs + cache overhead
-- **Cache:** Stored in `.pydra_cache/`
-
----
-
-## 5. Dependencies
-
-### 5.1 Docker Container
-- **Image:** `arkiev/compute-sub-metrics:latest`
-- **Base:** MRtrix3 on Debian
-- **Components:**
-  - MRtrix3 (latest)
-  - ANTs 2.5.0
-  - Python 3 (matplotlib, numpy, pandas, seaborn, scipy, pillow)
-  - Xvfb (virtual display)
-
-### 5.2 Template Data (Built into Container)
-- **Template phantom:** `ImageTemplate.nii.gz`
-- **Vial segmentations:** 20+ labeled vials
-- **Rotation library:** 120 rigid transforms
-- **Python plotting scripts:** `plot_vial_intensity.py`, `plot_maps_ir.py`, `plot_maps_TE.py`
-
-### 5.3 Host Requirements
-- **Docker:** Version 20.10+
-- **Python:** 3.8+ (for Pydra)
-- **Pydra:** Latest version
-- **Storage:** ~2 GB per session output
-- **RAM:** 4 GB minimum, 8 GB recommended
-- **CPU:** Multi-core recommended for parallel processing
-
----
-
-## 6. Quality Control
-
-### 6.1 Automated QC Checks
-
-#### 6.1.1 Registration Validation
-- **Check 1:** High-intensity vials (A, O, Q) in top 5 by mean intensity
-- **Check 2:** Low-intensity vials (S, D, P) in bottom 5 by mean intensity
-- **Check 3:** Vial standard deviation < 50 (homogeneity check)
-
-**Action on Failure:**
-- Try next rotation from library (up to 120 attempts)
-- Report iteration count in output
-
-#### 6.1.2 File Validation
-- Input file exists and readable
-- NIfTI format valid
-- Sufficient disk space for output
-
-### 6.2 Manual QC Recommendations
-- Review `TemplatePhantom_ScannerSpace.nii.gz` overlay
-- Check vial segmentation alignment in screenshots
-- Inspect metric plots for outliers
-- Verify expected vial ordering (high vs low intensity)
-
----
-
-## 7. Performance Specifications
-
-### 7.1 Timing Benchmarks
-
-| Component | Time (typical) | Time (worst case) |
-|-----------|----------------|-------------------|
-| Registration (single attempt) | 1-3 min | 5 min |
-| Registration (with retries) | 3-10 min | 15 min |
-| Metrics extraction | 30 sec - 2 min | 5 min |
-| Visualization | 30 sec - 1 min | 2 min |
-| **Total per session** | **5-15 min** | **30 min** |
-
-### 7.2 Scalability
-
-| Sessions | Mode | Time (n_procs=4) | Memory |
-|----------|------|------------------|--------|
-| 1 | Basic | 5-15 min | 4 GB |
-| 10 | Batch | 15-40 min | 16 GB |
-| 50 | Batch | 1-3 hours | 16 GB |
-| 100+ | Pipeline | 2-6 hours | 16 GB + cache |
-
-### 7.3 Resource Optimization
-- **CPU:** Use `--n-procs` = number of CPU cores (max 8 per session)
-- **Memory:** Limit parallel sessions to available RAM / 4 GB
-- **Storage:** SSD recommended for cache and output directories
-
----
-
-## 8. Error Handling
-
-### 8.1 Common Errors
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `Docker command failed` | Container not running | Check Docker Desktop running |
-| `Input image not found` | Invalid path | Verify absolute path and file exists |
-| `Registration failed after 120 iterations` | Poor image quality or wrong phantom | Check input image, verify phantom type |
-| `No images found` | Pattern mismatch | Adjust `--pattern` to match filenames |
-| `Permission denied` | Output directory permissions | Use `--user $(id -u):$(id -g)` in Docker |
-
-### 8.2 Logging
-- **stdout:** Real-time progress and results
-- **stderr:** Errors and warnings
-- **Docker logs:** Container execution details (captured by subprocess)
-- **Pydra cache:** Task provenance and results (pipeline mode)
-
-### 8.3 Recovery Strategies
-- **Single session failure (batch mode):** Continue processing remaining sessions
-- **Docker failure:** Retry mechanism not implemented (manual restart)
-- **Interrupted pipeline:** Resume from cache (pipeline mode only)
-
----
-
-## 9. Extensibility
-
-### 9.1 Adding New QC Metrics
-
-**Example:** Add SNR calculation
-
-```python
-class PhantomPipeline:
-    def calculate_snr(self, session_dir):
-        """Calculate signal-to-noise ratio"""
-        # Read vial metrics
-        mean_signal = ...
-        std_noise = ...
-        snr = mean_signal / std_noise
-        return snr
-    
-    def run_with_qc(self):
-        for session in self.find_sessions():
-            self.run_single(session)
-            snr = self.calculate_snr(session)
-            print(f"SNR: {snr:.2f}")
-```
-
-### 9.2 Custom Preprocessing
-
-**Example:** Add motion correction step
-
-```python
-class PhantomPipeline:
-    def preprocess_session(self, session_dir):
-        """Run motion correction before processing"""
-        # Add preprocessing steps
-        pass
-    
-    def run_batch(self, ...):
-        sessions = self.find_sessions()
-        for session in sessions:
-            self.preprocess_session(session)  # NEW
-            self.run_single(session)
-```
-
-### 9.3 Alternative Docker Images
-
-**Example:** Use custom Docker image
-
-```python
-class PhantomPipeline:
-    def __init__(self, data_dir, output_dir, docker_image=None):
-        self.docker_image = docker_image or "arkiev/compute-sub-metrics:latest"
-    
-    def create_task(self, ...):
-        cmd = ["docker", "run", self.docker_image, ...]  # Uses custom image
-```
-
-### 9.4 Output Format Changes
-
-**Example:** Add JSON output
-
-```python
-class PhantomPipeline:
-    def export_to_json(self, session_name):
-        """Convert CSV metrics to JSON"""
-        import json
-        import pandas as pd
-        
-        csv_file = self.output_dir / session_name / "metrics" / "mean_matrix.csv"
-        df = pd.read_csv(csv_file)
-        json_file = csv_file.with_suffix('.json')
-        df.to_json(json_file, orient='records')
+echo "gsp_vial_metrics" > .python-version
 ```
 
 ---
 
-## 10. Validation & Testing
+### Data Issues
 
-### 10.1 Unit Tests (Future Work)
-- Test rotation library loading
-- Test registration validation logic
-- Test CSV writing/reading
-- Test path handling (cross-platform)
+**Problem:** `No vial masks found in: .../VialsLabelled`
 
-### 10.2 Integration Tests (Future Work)
-- End-to-end processing of test phantom
-- Batch processing of multiple test cases
-- Verify output file structure
-- Validate metric accuracy against ground truth
-
-### 10.3 Performance Tests (Future Work)
-- Benchmark processing time per session
-- Memory profiling
-- Parallel efficiency testing
-- Cache performance evaluation
+**Solution:** 
+- Check that vial masks are `.nii.gz` (not `.nii`)
+- Verify TemplateData structure matches expected format
 
 ---
 
-## 11. Deployment
+**Problem:** `IndexError: list index out of range` during metric extraction
 
-### 11.1 Local Installation
-
-**Prerequisites:**
-1. Install Docker Desktop
-2. Install Python 3.8+
-3. Create virtual environment
-4. Install Pydra: `pip install pydra`
-5. Pull Docker image: `docker pull arkiev/compute-sub-metrics:latest`
-
-**Setup:**
-```bash
-git clone <repository>
-cd GSP_vial_metrics
-python -m venv venv  # or use pyenv
-source venv/bin/activate
-pip install pydra
-python .vscode/test_setup.py  # Verify installation
-```
-
-### 11.2 HPC Deployment (Future Work)
-
-**Considerations:**
-- Replace Docker with Singularity (HPC-compatible)
-- Use Pydra SLURM plugin for job submission
-- Shared filesystem for cache and outputs
-- Module system for dependencies
-
-**Example SLURM submission:**
-```bash
-sbatch --array=1-100 --cpus-per-task=8 --mem=8G \
-    pydra_batch_slurm.sh /data/phantoms /results
-```
-
-### 11.3 Cloud Deployment (Future Work)
-
-**Options:**
-- AWS Batch with Docker containers
-- Google Cloud Run
-- Azure Container Instances
-
-**Considerations:**
-- Data transfer costs
-- Storage (S3, Cloud Storage)
-- Compute costs
-- Egress bandwidth
+**Solution:**
+- Registration may be poor quality
+- Image FOV may not include all vials
+- Run with updated script that has error handling
+- Visually inspect registration with `mrview`
 
 ---
 
-## 12. Maintenance & Support
+**Problem:** Registration check passes but vials don't overlap
 
-### 12.1 Version Control
-- **Repository:** GitHub (recommended)
-- **Branching:** main (stable), dev (development)
-- **Releases:** Semantic versioning (v1.0.0, v1.1.0, ...)
-- **Docker tags:** Match release versions
-
-### 12.2 Update Procedures
-
-**Docker Image Updates:**
-1. Rebuild container: `docker build -t compute-sub-metrics:v1.1 .`
-2. Tag: `docker tag compute-sub-metrics:v1.1 arkiev/compute-sub-metrics:v1.1`
-3. Push: `docker push arkiev/compute-sub-metrics:v1.1`
-4. Update scripts to reference new version
-
-**Python Code Updates:**
-1. Update scripts in `.vscode/`
-2. Test with `test_setup.py`
-3. Update version in documentation
-4. Commit and push to repository
-
-### 12.3 Documentation
-- **README.md:** Quick start guide
-- **SETUP_MAC.md:** Platform-specific setup
-- **PIPELINE_SPEC.md:** This document
-- **API docs:** (Future work - Sphinx or MkDocs)
+**Solution:**
+- Contrast images may have different geometry than T1
+- Check image dimensions: `mrinfo your_image.nii.gz`
+- Visually verify: `mrview contrast.nii.gz -overlay.load vial_mask.nii.gz`
 
 ---
 
-## 13. Future Enhancements
+## Development Notes
 
-### 13.1 Planned Features
-- [ ] Web interface for job submission and monitoring
-- [ ] Automated report generation (PDF)
-- [ ] Database backend for metrics storage
-- [ ] Longitudinal analysis tools
-- [ ] Group statistic
+### Version History
+
+**Checkpoint 1 (Current):**
+- ✅ Full pipeline functional
+- ✅ Supports `.nii.gz` vial masks
+- ✅ Scatter plots with no connecting lines
+- ✅ Proper vial name extraction for compressed files
+- ✅ Error handling for empty mrstats output
+- ✅ T1/T2 curve fitting with 95% CI
+
+### Key Fixes Applied
+
+1. **Vial mask extension handling** - Changed from `.nii` to `.nii.gz`
+2. **Vial name extraction** - Fixed for double extensions (`A.nii.gz` → `A`)
+3. **Scatter plot implementation** - Separated `ax.errorbar()` and `ax.scatter()`
+4. **Error handling** - Graceful handling of empty mrstats output
+
+---
+
+## Citation
+
+If you use this pipeline, please cite:
+
+[Citation information to be added]
+
+---
+
+## Support
+
+For issues or questions:
+- Check the troubleshooting section above
+- Review documentation in `/docs` (if available)
+- Contact: [contact information]
+
+---
+
+## License
+
+[License information to be added]
