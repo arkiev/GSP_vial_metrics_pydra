@@ -244,7 +244,8 @@ def plot_vial_means_std_pub_from_nifti(
             # Attempt to fit T1 inversion recovery curve to the data
             try:
                 # Non-linear least squares curve fitting
-                popt, _ = curve_fit(
+                # Keep the covariance matrix (pcov) for confidence interval calculation
+                popt, pcov = curve_fit(
                     inv_rec,                          # Model function to fit
                     contrast_numbers,                 # x data (inversion times)
                     mean_matrix[i, :],                # y data (intensities)
@@ -262,14 +263,57 @@ def plot_vial_means_std_pub_from_nifti(
                     {"Vial": vial, "S0": S0_fit, "T1_ms": T1_fit, "R2": r2}
                 )
 
+                # ============================================================
+                # *** 95% CONFIDENCE INTERVAL CALCULATION ***
+                # ============================================================
+                # Create fine grid for smooth curve visualization
+                x_fit = np.linspace(min(contrast_numbers), max(contrast_numbers), 200)
+                
+                # Calculate 95% CI via Monte Carlo sampling from parameter covariance
+                ci_lower = None
+                ci_upper = None
+                try:
+                    # Sample parameter space (1000 samples from multivariate normal)
+                    n_samples = 1000
+                    param_samples = np.random.multivariate_normal(popt, pcov, n_samples)
+                    
+                    # Generate predictions for each parameter sample
+                    predictions = np.array([
+                        inv_rec(x_fit, sample[0], sample[1])
+                        for sample in param_samples
+                    ])
+                    
+                    # Calculate 2.5th and 97.5th percentiles (95% CI)
+                    ci_lower = np.percentile(predictions, 2.5, axis=0)
+                    ci_upper = np.percentile(predictions, 97.5, axis=0)
+                    
+                except (np.linalg.LinAlgError, ValueError) as e:
+                    # Covariance matrix might be singular or ill-conditioned
+                    print(f"[WARN] Could not calculate 95% CI for vial {vial}: {e}")
+                
+                # ============================================================
+                # *** FITTED CURVE AND CI BAND PLOTTING ***
+                # ============================================================
+                # Plot 95% confidence interval band (if calculated successfully)
+                if ci_lower is not None and ci_upper is not None:
+                    ax.fill_between(
+                        x_fit,
+                        ci_lower,
+                        ci_upper,
+                        color="gray",          # Gray to match fitted curve
+                        alpha=0.2,             # Transparent (subtle background)
+                        zorder=1,              # Behind fitted curve and data
+                        label="95% CI",        # Legend label
+                    )
+
                 # Plot smooth fitted curve (dashed line) over data
-                te_fit = np.linspace(min(contrast_numbers), max(contrast_numbers), 100)
                 ax.plot(
-                    te_fit,
-                    inv_rec(te_fit, *popt),
+                    x_fit,
+                    inv_rec(x_fit, *popt),
                     "--",                  # Dashed line style
                     color="gray",          # Gray color for fitted curve
                     alpha=0.8,             # Slight transparency
+                    zorder=2,              # On top of CI band, below data
                     label="T₁ fit",       # Legend label
                 )
             except RuntimeError:
@@ -317,7 +361,8 @@ def plot_vial_means_std_pub_from_nifti(
                 # Attempt to fit T1 inversion recovery curve
                 try:
                     # Non-linear least squares curve fitting
-                    popt, _ = curve_fit(
+                    # Keep covariance matrix for CI calculation
+                    popt, pcov = curve_fit(
                         inv_rec,
                         contrast_numbers,
                         mean_matrix[i, :],
@@ -335,16 +380,55 @@ def plot_vial_means_std_pub_from_nifti(
                         {"Vial": vial, "S0": S0_fit, "T1_ms": T1_fit, "R2": r2}
                     )
 
+                    # ========================================================
+                    # *** 95% CONFIDENCE INTERVAL CALCULATION ***
+                    # ========================================================
+                    # Create fine grid for smooth curve
+                    x_fit = np.linspace(min(contrast_numbers), max(contrast_numbers), 200)
+                    
+                    # Calculate 95% CI via Monte Carlo sampling
+                    ci_lower = None
+                    ci_upper = None
+                    try:
+                        # Sample parameter space
+                        n_samples = 1000
+                        param_samples = np.random.multivariate_normal(popt, pcov, n_samples)
+                        
+                        # Generate predictions
+                        predictions = np.array([
+                            inv_rec(x_fit, sample[0], sample[1])
+                            for sample in param_samples
+                        ])
+                        
+                        # Calculate percentiles (95% CI)
+                        ci_lower = np.percentile(predictions, 2.5, axis=0)
+                        ci_upper = np.percentile(predictions, 97.5, axis=0)
+                        
+                    except (np.linalg.LinAlgError, ValueError) as e:
+                        print(f"[WARN] Could not calculate 95% CI for vial {vial}: {e}")
+                    
+                    # ========================================================
+                    # *** PLOT CI BAND AND FITTED CURVE ***
+                    # ========================================================
+                    # Plot 95% CI band (if calculated)
+                    if ci_lower is not None and ci_upper is not None:
+                        ax.fill_between(
+                            x_fit,
+                            ci_lower,
+                            ci_upper,
+                            color=cmap(j % 10),    # Match vial color
+                            alpha=0.15,             # Very transparent
+                            zorder=1,               # Behind everything
+                        )
+
                     # Plot smooth fitted curve (dashed, same color as data)
-                    te_fit = np.linspace(
-                        min(contrast_numbers), max(contrast_numbers), 100
-                    )
                     ax.plot(
-                        te_fit,
-                        inv_rec(te_fit, *popt),
+                        x_fit,
+                        inv_rec(x_fit, *popt),
                         "--",                  # Dashed line
                         color=cmap(j % 10),    # Match data color
                         alpha=0.8,
+                        zorder=2,              # On top of CI, below data
                     )
                 except RuntimeError:
                     print(f"[WARN] Could not fit T₁ for vial {vial}")
