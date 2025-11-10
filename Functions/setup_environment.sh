@@ -175,3 +175,6 @@ echo "    --template-dir /path/to/TemplateData \\"
 echo "    --output-dir /path/to/Outputs \\"
 echo "    --rotation-lib /path/to/TemplateData/rotations.txt"
 echo ""
+
+
+ export PATH=/Applications/ants-2.6.3/bin:$PATH
