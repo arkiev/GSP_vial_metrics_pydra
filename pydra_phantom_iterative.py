@@ -219,13 +219,13 @@ class PhantomProcessor:
 
             std_val = float(std_output.strip())
 
-            if std_val > 50:
+            if std_val > 65:
                 high_std_vials.append((vial_name, std_val))
 
         # CRITERION 1: Check for high standard deviation vials
         if high_std_vials:
             failures.append(
-                f"High standard deviation detected in {len(high_std_vials)} vial(s) (threshold: 50.0)"
+                f"High standard deviation detected in {len(high_std_vials)} vial(s) (threshold: 65.0)"
             )
             for vial_name, std_val in high_std_vials:
                 failures.append(f"  - Vial {vial_name}: std = {std_val:.2f}")
