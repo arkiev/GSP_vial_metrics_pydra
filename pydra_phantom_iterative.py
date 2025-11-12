@@ -39,7 +39,9 @@ class PhantomProcessor:
         # Template files
         self.template_phantom = self.template_dir / "ImageTemplate.nii.gz"
         self.vial_dir = self.template_dir / "VialsLabelled"
-        self.vial_masks = sorted(self.vial_dir.glob("*.nii.gz"))  # Fixed to accept .nii.gz files
+        self.vial_masks = sorted(
+            self.vial_dir.glob("*.nii.gz")
+        )  # Fixed to accept .nii.gz files
 
         # Load rotation library
         self.rotations = self._load_rotations()
@@ -117,8 +119,11 @@ class PhantomProcessor:
         """
         Check if registration is correct based on vial intensities
         Returns True if correct, False otherwise
+        Now with detailed failure reporting
         """
         vial_means = {}
+        high_std_vials = []
+        failures = []
 
         for vial_mask in self.vial_masks:
             # Handle both .nii and .nii.gz extensions properly
@@ -215,7 +220,15 @@ class PhantomProcessor:
             std_val = float(std_output.strip())
 
             if std_val > 50:
-                return False
+                high_std_vials.append((vial_name, std_val))
+
+        # CRITERION 1: Check for high standard deviation vials
+        if high_std_vials:
+            failures.append(
+                f"High standard deviation detected in {len(high_std_vials)} vial(s) (threshold: 50.0)"
+            )
+            for vial_name, std_val in high_std_vials:
+                failures.append(f"  - Vial {vial_name}: std = {std_val:.2f}")
 
         # Check top and bottom vials
         sorted_vials = sorted(vial_means.items(), key=lambda x: x[1], reverse=True)
@@ -225,19 +238,61 @@ class PhantomProcessor:
         required_top = ["A", "O", "Q"]
         required_bottom = ["S", "D", "P"]
 
-        for v in required_top:
-            if v not in top5:
-                return False
+        # CRITERION 2: Check required high-intensity vials
+        missing_top = [v for v in required_top if v not in top5]
+        if missing_top:
+            failures.append(
+                f"Required high-intensity vials NOT in top 5: {missing_top}"
+            )
+            failures.append(f"  Expected in top 5: {required_top}")
+            failures.append(f"  Actual top 5: {top5}")
+            # Show where the missing vials actually are
+            for v in missing_top:
+                actual_rank = [name for name, _ in sorted_vials].index(v) + 1
+                actual_intensity = vial_means[v]
+                failures.append(
+                    f"  Vial {v} is at rank #{actual_rank} with intensity {actual_intensity:.1f}"
+                )
 
-        for v in required_bottom:
-            if v not in bottom5:
-                return False
+        # CRITERION 3: Check required low-intensity vials
+        missing_bottom = [v for v in required_bottom if v not in bottom5]
+        if missing_bottom:
+            failures.append(
+                f"Required low-intensity vials NOT in bottom 5: {missing_bottom}"
+            )
+            failures.append(f"  Expected in bottom 5: {required_bottom}")
+            failures.append(f"  Actual bottom 5: {bottom5}")
+            # Show where the missing vials actually are
+            for v in missing_bottom:
+                actual_rank = [name for name, _ in sorted_vials].index(v) + 1
+                actual_intensity = vial_means[v]
+                failures.append(
+                    f"  Vial {v} is at rank #{actual_rank} with intensity {actual_intensity:.1f}"
+                )
 
-        print(f"  ✓ Registration check passed")
-        print(f"    Top 5 vials: {top5}")
-        print(f"    Bottom 5 vials: {bottom5}")
-
-        return True
+        # Report results
+        if failures:
+            print(f"  ✗ Registration check FAILED - {len(failures)} issue(s) detected:")
+            print(f"  " + "=" * 58)
+            for failure in failures:
+                print(f"  {failure}")
+            print(f"  " + "=" * 58)
+            print(f"\n  All vial intensities (sorted):")
+            for i, (vial_name, intensity) in enumerate(sorted_vials, 1):
+                marker = ""
+                if vial_name in required_top:
+                    marker = " ← expected high"
+                elif vial_name in required_bottom:
+                    marker = " ← expected low"
+                print(f"    #{i:2d}. Vial {vial_name}: {intensity:.1f}{marker}")
+            return False
+        else:
+            print(f"  ✓ Registration check passed")
+            print(f"    Top 5 vials: {top5}")
+            print(f"    Bottom 5 vials: {bottom5}")
+            if high_std_vials:
+                print(f"    Note: No high-std vials detected")
+            return True
 
     def _apply_rotation(
         self, input_image: str, rotation_matrix_file: str, output_image: str
@@ -612,7 +667,9 @@ class PhantomProcessor:
                 # Regrid each vial to contrast space and combine
                 regridded_vials = []
                 for vial_mask in vial_masks_list:
-                    vial_name = vial_mask.name.replace(".nii.gz", "").replace(".nii", "")
+                    vial_name = vial_mask.name.replace(".nii.gz", "").replace(
+                        ".nii", ""
+                    )
                     regridded = str(tmp_vial_dir / f"{contrast_name}_{vial_name}.nii")
 
                     cmd = [
@@ -724,7 +781,9 @@ class PhantomProcessor:
                     # Regrid vials and combine
                     regridded_vials = []
                     for vial_mask in vial_masks_list:
-                        vial_name = vial_mask.name.replace(".nii.gz", "").replace(".nii", "")
+                        vial_name = vial_mask.name.replace(".nii.gz", "").replace(
+                            ".nii", ""
+                        )
                         regridded = str(tmp_vial_dir / f"ir_{vial_name}.nii")
 
                         cmd = [
@@ -829,7 +888,9 @@ class PhantomProcessor:
                     # Regrid vials and combine
                     regridded_vials = []
                     for vial_mask in vial_masks_list:
-                        vial_name = vial_mask.name.replace(".nii.gz", "").replace(".nii", "")
+                        vial_name = vial_mask.name.replace(".nii.gz", "").replace(
+                            ".nii", ""
+                        )
                         regridded = str(tmp_vial_dir / f"te_{vial_name}.nii")
 
                         cmd = [
