@@ -219,13 +219,13 @@ class PhantomProcessor:
 
             std_val = float(std_output.strip())
 
-            if std_val > 65:
+            if std_val > 50:
                 high_std_vials.append((vial_name, std_val))
 
         # CRITERION 1: Check for high standard deviation vials
         if high_std_vials:
             failures.append(
-                f"High standard deviation detected in {len(high_std_vials)} vial(s) (threshold: 65.0)"
+                f"High standard deviation detected in {len(high_std_vials)} vial(s) (threshold: 50.0)"
             )
             for vial_name, std_val in high_std_vials:
                 failures.append(f"  - Vial {vial_name}: std = {std_val:.2f}")
@@ -1073,10 +1073,24 @@ class PhantomProcessor:
             session_name=session_name,
         )
 
-        # Clean up temp directory
+        # Clean up temporary directories
+        print("\nStep 5: Cleaning up temporary directories")
         import shutil
 
-        shutil.rmtree(tmp_dir)
+        temp_dirs_to_remove = [
+            tmp_dir,  # Main temp directory
+            output_dir / "tmp_vials",  # Vial transformation temp directory
+            output_dir / "tmp_vols",  # Volume extraction temp directory
+            vial_dir / "tmp",  # Vial plotting temp directory
+        ]
+
+        for temp_dir in temp_dirs_to_remove:
+            if temp_dir.exists():
+                try:
+                    shutil.rmtree(temp_dir)
+                    print(f"  ✓ Removed: {temp_dir.name}")
+                except Exception as e:
+                    print(f"  ⚠ Warning: Could not remove {temp_dir.name}: {e}")
 
         print(f"\n{'='*60}")
         print(f"✓ Session {session_name} complete!")
