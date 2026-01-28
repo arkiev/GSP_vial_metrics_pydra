@@ -329,9 +329,9 @@ echo "gsp_vial_metrics" > .python-version
 
 ## Citation
 
-If you use this pipeline, please cite:
+If you use this pipeline, please include the following acknowledgement:
 
-[Citation information to be added]
+The authors acknowledge the facilities and scientific and technical assistance of the National Imaging Facility, a National Collaborative Research Infrastructure Strategy (NCRIS) capability, at Sydney Imaging, the University of Sydney.
 
 ---
 
