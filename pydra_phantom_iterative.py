@@ -450,6 +450,93 @@ class PhantomProcessor:
 
         return transformed_vials
 
+    def _transform_contrast_to_template_space(
+        self,
+        contrast_file: Path,
+        transform_matrix: str,
+        rotation_matrix_file: str,
+        iteration: int,
+        tmp_dir: Path,
+    ) -> str:
+        """
+        Transform a contrast image from subject space into template space.
+
+        Applies the forward ANTs affine transform (and inverse rotation if
+        iteration > 1) so that the warped contrast can be measured directly
+        against the template vial masks.
+
+        Parameters
+        ----------
+        contrast_file : Path
+            Contrast image in subject space.
+        transform_matrix : str
+            Path to the ANTs affine .mat file produced during registration.
+        rotation_matrix_file : str or None
+            Path to the rotation matrix used in the iterative registration, or
+            None if no rotation was needed (iteration == 1).
+        iteration : int
+            Registration iteration that succeeded.
+        tmp_dir : Path
+            Temporary directory for intermediate files.
+
+        Returns
+        -------
+        str
+            Path to the contrast image now in template space.
+        """
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        contrast_name = contrast_file.stem.replace(".nii", "")
+
+        # If a rotation was applied to the input before registration, we must
+        # first replicate that rotation on this contrast image before applying
+        # the ANTs forward transform.
+        if iteration > 1 and rotation_matrix_file:
+            rotated_contrast = str(tmp_dir / f"{contrast_name}_rotated.nii.gz")
+            cmd = [
+                "mrtransform",
+                str(contrast_file),
+                rotated_contrast,
+                "-linear",
+                rotation_matrix_file,
+                "-interp",
+                "linear",
+                "-force",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Rotation of contrast {contrast_name} failed: {result.stderr}"
+                )
+            source_image = rotated_contrast
+        else:
+            source_image = str(contrast_file)
+
+        # Apply the forward ANTs affine transform (no [mat, 1] inversion flag)
+        # Reference is the template phantom so the output lives in template space.
+        warped_contrast = str(tmp_dir / f"{contrast_name}_template_space.nii.gz")
+        cmd = [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-i",
+            source_image,
+            "-r",
+            str(self.template_phantom),
+            "-o",
+            warped_contrast,
+            "-t",
+            transform_matrix,
+            "-n",
+            "Linear",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Forward transform of contrast {contrast_name} failed: {result.stderr}"
+            )
+
+        return warped_contrast
+
     def _extract_metrics_from_contrast(
         self,
         contrast_file: Path,
@@ -756,8 +843,17 @@ class PhantomProcessor:
     ):
         """Generate T1/T2 parametric map plots"""
 
+        import re as _re
+
+        def _matches_contrast_type(stem: str, token: str) -> bool:
+            """Match token as a standalone word in the filename stem.
+            Prevents false positives like 'te' matching inside 'template'."""
+            return bool(_re.search(rf"(?<![a-z0-9]){token}(?![a-z0-9])", stem.lower()))
+
         # Check for IR contrasts
-        ir_contrasts = [f for f in contrast_files if "ir" in f.stem.lower()]
+        ir_contrasts = [
+            f for f in contrast_files if _matches_contrast_type(f.stem, "ir")
+        ]
         if ir_contrasts:
             print(
                 f"  Found {len(ir_contrasts)} IR contrasts: {[f.name for f in ir_contrasts]}"
@@ -864,7 +960,9 @@ class PhantomProcessor:
             print(f"  No IR contrasts found (searched for 'ir' in filenames)")
 
         # Check for TE contrasts
-        te_contrasts = [f for f in contrast_files if "te" in f.stem.lower()]
+        te_contrasts = [
+            f for f in contrast_files if _matches_contrast_type(f.stem, "te")
+        ]
         if te_contrasts:
             print(
                 f"  Found {len(te_contrasts)} TE contrasts: {[f.name for f in te_contrasts]}"
@@ -970,28 +1068,52 @@ class PhantomProcessor:
         else:
             print(f"  No TE contrasts found (searched for 'te' in filenames)")
 
-    def process_session(self, input_image: str):
+    def process_session(self, input_image: str, measurement_space: str = "subject"):
         """
-        Process a single phantom session
+        Process a single phantom session.
 
         Parameters
         ----------
         input_image : str
-            Path to primary input image
+            Path to primary input image.
+        measurement_space : str, optional
+            Space in which vial metrics are measured.
+
+            ``"subject"`` (default)
+                The existing behaviour: vial masks are inverse-transformed into
+                subject space and metrics are extracted from the original contrast
+                images.
+
+            ``"template"``
+                Each contrast image is forward-transformed into template space and
+                metrics are extracted there using the native template vial masks.
+                This avoids any interpolation of the (binary) masks and can improve
+                reproducibility across sites.
 
         Returns
         -------
         results : dict
-            Processing results and output paths
+            Processing results and output paths.
         """
+        if measurement_space not in ("subject", "template"):
+            raise ValueError(
+                f"measurement_space must be 'subject' or 'template', got '{measurement_space}'"
+            )
         input_path = Path(input_image)
         session_name = input_path.parent.name
 
-        # Create output directories
+        # Create output directories.
+        # Template-space outputs are kept in a parallel folder tree so both
+        # measurement modes can coexist for the same session.
         output_dir = self.output_base_dir / session_name
         tmp_dir = output_dir / "tmp"
-        vial_dir = output_dir / "vial_segmentations"
-        metrics_dir = output_dir / "metrics"
+
+        if measurement_space == "template":
+            vial_dir = output_dir / "vial_segmentations_template_space"
+            metrics_dir = output_dir / "metrics_template_space"
+        else:
+            vial_dir = output_dir / "vial_segmentations"
+            metrics_dir = output_dir / "metrics"
 
         for d in [tmp_dir, vial_dir, metrics_dir]:
             d.mkdir(parents=True, exist_ok=True)
@@ -1000,6 +1122,7 @@ class PhantomProcessor:
         print(f"Processing Session: {session_name}")
         print(f"Input: {input_image}")
         print(f"Output: {output_dir}")
+        print(f"Measurement space: {measurement_space}")
         print(f"{'='*60}\n")
 
         # Step 1: Registration with iteration
@@ -1013,63 +1136,137 @@ class PhantomProcessor:
             rotation_matrix_file,
         ) = self._register_with_iteration(str(input_image), session_name, tmp_dir)
 
-        # Save template phantom in scanner space
-        template_scanner_space = str(output_dir / "TemplatePhantom_ScannerSpace.nii.gz")
-        if iteration == 1:
+        if measurement_space == "subject":
+            # Save the template phantom warped into scanner (subject) space —
+            # useful for visual QC of the registration in subject space.
+            template_scanner_space = str(
+                output_dir / "TemplatePhantom_ScannerSpace.nii.gz"
+            )
+            if iteration == 1:
+                cmd = [
+                    "mrconvert",
+                    "-quiet",
+                    inverse_warped,
+                    template_scanner_space,
+                    "-force",
+                ]
+            else:
+                cmd = [
+                    "mrtransform",
+                    inverse_warped,
+                    template_scanner_space,
+                    "-linear",
+                    rotation_matrix_file,
+                    "-interp",
+                    "nearest",
+                    "-inverse",
+                    "-force",
+                ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"  ✓ Saved template in scanner space")
+        else:
+            # Save the input image warped into template space — the direct
+            # output of ANTs registration, useful for visual QC of alignment
+            # against the template and its vial masks.
+            input_template_space = str(output_dir / "InputImage_TemplateSpace.nii.gz")
             cmd = [
                 "mrconvert",
                 "-quiet",
-                inverse_warped,
-                template_scanner_space,
+                warped,
+                input_template_space,
                 "-force",
             ]
-        else:
-            cmd = [
-                "mrtransform",
-                inverse_warped,
-                template_scanner_space,
-                "-linear",
-                rotation_matrix_file,
-                "-interp",
-                "nearest",
-                "-inverse",
-                "-force",
-            ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        print(f"  ✓ Saved template in scanner space")
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"  ✓ Saved input image in template space")
 
-        # Step 2: Transform vials to subject space
-        print("\nStep 2: Transforming vials to subject space")
-        transformed_vials = self._transform_vials_to_subject_space(
-            reference_image=str(input_image),
-            transform_matrix=transform,
-            rotation_matrix_file=rotation_matrix_file,
-            iteration=iteration,
-            output_vial_dir=vial_dir,
-        )
-        print(f"  ✓ Transformed {len(transformed_vials)} vial masks")
-
-        # Step 3: Extract metrics from all contrasts
-        print("\nStep 3: Extracting metrics from all contrasts")
+        # Gather all contrast images in the session folder
         contrast_files = list(input_path.parent.glob("*.nii.gz"))
-        print(f"  Found {len(contrast_files)} contrast images")
 
-        all_metrics = {}
-        for contrast_file in contrast_files:
-            metrics_data = self._extract_metrics_from_contrast(
-                contrast_file=contrast_file,
-                vial_masks=transformed_vials,
-                output_metrics_dir=metrics_dir,
-                session_name=session_name,
+        if measurement_space == "template":
+            # ------------------------------------------------------------------
+            # TEMPLATE-SPACE MODE
+            # Each contrast image is forward-transformed into template space.
+            # The native template vial masks are used directly — no mask
+            # interpolation into subject space is required.
+            # ------------------------------------------------------------------
+            print("\nStep 2: Transforming contrast images to template space")
+            print(f"  Found {len(contrast_files)} contrast image(s)")
+
+            tmp_template_space_dir = tmp_dir / "template_space_contrasts"
+            tmp_template_space_dir.mkdir(parents=True, exist_ok=True)
+
+            warped_contrast_files = []
+            for contrast_file in contrast_files:
+                print(f"  Transforming: {contrast_file.name}")
+                warped_path = self._transform_contrast_to_template_space(
+                    contrast_file=contrast_file,
+                    transform_matrix=transform,
+                    rotation_matrix_file=rotation_matrix_file,
+                    iteration=iteration,
+                    tmp_dir=tmp_template_space_dir,
+                )
+                warped_contrast_files.append(Path(warped_path))
+                print(f"    ✓ {contrast_file.name} → template space")
+
+            # Use the original template vial masks directly
+            template_vial_masks = [str(m) for m in self.vial_masks]
+            print(
+                f"\nStep 3: Extracting metrics from template-space contrasts "
+                f"using {len(template_vial_masks)} template vial masks"
             )
-            all_metrics[contrast_file.name] = metrics_data
+
+            all_metrics = {}
+            for warped_contrast in warped_contrast_files:
+                metrics_data = self._extract_metrics_from_contrast(
+                    contrast_file=warped_contrast,
+                    vial_masks=template_vial_masks,
+                    output_metrics_dir=metrics_dir,
+                    session_name=session_name,
+                )
+                all_metrics[warped_contrast.name] = metrics_data
+
+            # Store the template vial masks path for plot generation
+            active_vial_dir = self.vial_dir
+            active_contrast_files = warped_contrast_files
+
+        else:
+            # ------------------------------------------------------------------
+            # SUBJECT-SPACE MODE (original behaviour)
+            # Vial masks are inverse-transformed into subject space and metrics
+            # are extracted directly from the original contrast images.
+            # ------------------------------------------------------------------
+            print("\nStep 2: Transforming vials to subject space")
+            transformed_vials = self._transform_vials_to_subject_space(
+                reference_image=str(input_image),
+                transform_matrix=transform,
+                rotation_matrix_file=rotation_matrix_file,
+                iteration=iteration,
+                output_vial_dir=vial_dir,
+            )
+            print(f"  ✓ Transformed {len(transformed_vials)} vial masks")
+
+            print("\nStep 3: Extracting metrics from all contrasts")
+            print(f"  Found {len(contrast_files)} contrast image(s)")
+
+            all_metrics = {}
+            for contrast_file in contrast_files:
+                metrics_data = self._extract_metrics_from_contrast(
+                    contrast_file=contrast_file,
+                    vial_masks=transformed_vials,
+                    output_metrics_dir=metrics_dir,
+                    session_name=session_name,
+                )
+                all_metrics[contrast_file.name] = metrics_data
+
+            active_vial_dir = vial_dir
+            active_contrast_files = contrast_files
 
         # Step 4: Generate plots
         print("\nStep 4: Generating plots")
         self._generate_plots(
-            contrast_files=contrast_files,
+            contrast_files=active_contrast_files,
             metrics_dir=metrics_dir,
-            vial_dir=vial_dir,
+            vial_dir=active_vial_dir,
             session_name=session_name,
         )
 
@@ -1079,9 +1276,10 @@ class PhantomProcessor:
 
         temp_dirs_to_remove = [
             tmp_dir,  # Main temp directory
-            output_dir / "tmp_vials",  # Vial transformation temp directory
-            output_dir / "tmp_vols",  # Volume extraction temp directory
-            vial_dir / "tmp",  # Vial plotting temp directory
+            output_dir / "tmp_vials",  # Vial transformation temp
+            output_dir / "tmp_vols",  # Volume extraction temp
+            vial_dir / "tmp",  # Vial plotting temp
+            tmp_dir / "template_space_contrasts",  # Template-space contrast temp
         ]
 
         for temp_dir in temp_dirs_to_remove:
@@ -1098,11 +1296,18 @@ class PhantomProcessor:
         print(f"  Vial masks: {vial_dir}")
         print(f"{'='*60}\n")
 
+        if measurement_space == "subject":
+            space_image = str(output_dir / "TemplatePhantom_ScannerSpace.nii.gz")
+        else:
+            space_image = str(output_dir / "InputImage_TemplateSpace.nii.gz")
+
         return {
             "session": session_name,
             "output_dir": str(output_dir),
             "metrics_dir": str(metrics_dir),
-            "vial_dir": str(vial_dir),
+            "vial_dir": str(active_vial_dir),
+            "measurement_space": measurement_space,
+            "space_image": space_image,
             "iteration": iteration,
             "metrics": all_metrics,
         }
@@ -1120,10 +1325,13 @@ class PhantomProcessor:
         "template_dir": str,
         "output_dir": str,
         "rotation_lib": str,
+        "measurement_space": str,
         "return": {"results": dict},
     }
 )
-def process_phantom_session(input_image, template_dir, output_dir, rotation_lib):
+def process_phantom_session(
+    input_image, template_dir, output_dir, rotation_lib, measurement_space="subject"
+):
     """Pydra task wrapper for phantom processing"""
     processor = PhantomProcessor(
         template_dir=template_dir,
@@ -1131,7 +1339,9 @@ def process_phantom_session(input_image, template_dir, output_dir, rotation_lib)
         rotation_library_file=rotation_lib,
     )
 
-    results = processor.process_session(input_image)
+    results = processor.process_session(
+        input_image, measurement_space=measurement_space
+    )
     return results
 
 
@@ -1140,6 +1350,7 @@ def create_batch_workflow(
     template_dir: str,
     output_dir: str,
     rotation_lib: str,
+    measurement_space: str = "subject",
     name: str = "phantom_batch",
 ):
     """Create Pydra workflow for batch processing"""
@@ -1160,6 +1371,7 @@ def create_batch_workflow(
             template_dir=template_dir,
             output_dir=output_dir,
             rotation_lib=rotation_lib,
+            measurement_space=measurement_space,
         )
     )
 
@@ -1193,6 +1405,17 @@ if __name__ == "__main__":
     single_parser.add_argument(
         "--rotation-lib", required=True, help="Rotation library file (rotations.txt)"
     )
+    single_parser.add_argument(
+        "--measurement-space",
+        default="subject",
+        choices=["subject", "template"],
+        help=(
+            "Space in which vial metrics are measured. "
+            "'subject' (default): vial masks are inverse-transformed into subject space. "
+            "'template': contrast images are forward-transformed into template space "
+            "and the native template vial masks are used directly."
+        ),
+    )
 
     # Batch command
     batch_parser = subparsers.add_parser(
@@ -1215,6 +1438,17 @@ if __name__ == "__main__":
         choices=["cf", "serial"],
         help="Pydra execution plugin",
     )
+    batch_parser.add_argument(
+        "--measurement-space",
+        default="subject",
+        choices=["subject", "template"],
+        help=(
+            "Space in which vial metrics are measured. "
+            "'subject' (default): vial masks are inverse-transformed into subject space. "
+            "'template': contrast images are forward-transformed into template space "
+            "and the native template vial masks are used directly."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1230,7 +1464,9 @@ if __name__ == "__main__":
             rotation_library_file=args.rotation_lib,
         )
 
-        results = processor.process_session(args.input_image)
+        results = processor.process_session(
+            args.input_image, measurement_space=args.measurement_space
+        )
 
         print("\n✓ Processing complete!")
         print(f"Results: {results['output_dir']}")
@@ -1261,6 +1497,7 @@ if __name__ == "__main__":
             template_dir=args.template_dir,
             output_dir=args.output_dir,
             rotation_lib=args.rotation_lib,
+            measurement_space=args.measurement_space,
             name="phantom_batch",
         )
 
