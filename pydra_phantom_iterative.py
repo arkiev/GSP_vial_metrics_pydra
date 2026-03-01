@@ -417,7 +417,7 @@ class PhantomProcessor:
                 "-t",
                 f"[{transform_matrix}, 1]",
                 "-n",
-                "NearestNeighbor",
+                "Linear",
             ]
 
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -511,19 +511,62 @@ class PhantomProcessor:
         else:
             source_image = str(contrast_file)
 
+        # Detect number of volumes so 4D series (IR, TE) are handled correctly.
+        # antsApplyTransforms requires -e 3 to apply a 3D transform to each
+        # volume of a 4D image independently; without it only the first volume
+        # is transformed.
+        detect_cmd = ["mrinfo", "-size", source_image]
+        detect_result = subprocess.run(detect_cmd, capture_output=True, text=True)
+        size_parts = detect_result.stdout.strip().split()
+        is_4d = len(size_parts) >= 4 and int(size_parts[3]) > 1
+
+        # Single-slice images (e.g. IR and TE acquisitions with 1 slice in z)
+        # cause antsApplyTransforms -d 3 to silently fail because the affine
+        # transform cannot map onto a degenerate z-dimension.  Work around this
+        # by padding to a 3-slice volume, transforming, then extracting slice 1.
+        check_size = subprocess.run(
+            ["mrinfo", "-size", source_image], capture_output=True, text=True
+        )
+        size_parts_src = check_size.stdout.strip().split()
+        is_single_slice = len(size_parts_src) >= 3 and int(size_parts_src[2]) == 1
+
+        if is_single_slice:
+            padded = str(tmp_dir / f"{contrast_name}_padded.nii.gz")
+            cmd = [
+                "mrgrid",
+                source_image,
+                "pad",
+                "-axis",
+                "2",
+                "1,1",
+                padded,
+                "-force",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Padding of single-slice contrast {contrast_name} failed: {result.stderr}"
+                )
+            transform_input = padded
+        else:
+            transform_input = source_image
+
         # Apply the forward ANTs affine transform (no [mat, 1] inversion flag)
         # Reference is the template phantom so the output lives in template space.
+        warped_tmp = str(tmp_dir / f"{contrast_name}_template_space_tmp.nii.gz")
         warped_contrast = str(tmp_dir / f"{contrast_name}_template_space.nii.gz")
         cmd = [
             "antsApplyTransforms",
             "-d",
             "3",
+            "-e",
+            "3" if is_4d else "0",
             "-i",
-            source_image,
+            transform_input,
             "-r",
             str(self.template_phantom),
             "-o",
-            warped_contrast,
+            warped_tmp,
             "-t",
             transform_matrix,
             "-n",
@@ -535,6 +578,24 @@ class PhantomProcessor:
                 f"Forward transform of contrast {contrast_name} failed: {result.stderr}"
             )
 
+        # Verify the output was actually created
+        verify = subprocess.run(
+            ["mrinfo", "-size", warped_tmp], capture_output=True, text=True
+        )
+        if verify.returncode != 0 or not verify.stdout.strip():
+            raise RuntimeError(
+                f"antsApplyTransforms produced no valid output for {contrast_name}. "
+                f"stderr: {result.stderr}"
+            )
+
+        # Keep the full 3D warped volume in all cases.
+        # For single-slice inputs, the warped 3D volume has signal concentrated
+        # near the original slice position — the 3D template vial masks sample
+        # it correctly, just as they do for a full 3D acquisition.
+        import shutil as _shutil
+
+        _shutil.move(warped_tmp, warped_contrast)
+
         return warped_contrast
 
     def _extract_metrics_from_contrast(
@@ -544,7 +605,7 @@ class PhantomProcessor:
         output_metrics_dir: Path,
         session_name: str,
     ):
-        """Extract metrics from one contrast image across all vials"""
+        """Extract metrics from one contrast image across all vials."""
         contrast_name = contrast_file.stem
 
         # Remove file extensions from contrast name for cleaner labels
@@ -583,22 +644,23 @@ class PhantomProcessor:
             for metric in metrics_data.keys():
                 metrics_data[metric][vial_name] = []
 
-            # Regrid vial to contrast space
+            # Regrid vial mask to match the warped contrast grid exactly.
             regridded_mask = str(tmp_vol_dir / f"{contrast_name}_{vial_name}.nii")
             cmd = [
                 "mrgrid",
-                vial_mask,
                 "-template",
                 str(contrast_file),
-                "-interp",
-                "nearest",
-                "-quiet",
+                vial_mask,
                 "regrid",
                 regridded_mask,
                 "-force",
             ]
-            subprocess.run(cmd, check=True, capture_output=True)
-
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"mrgrid regrid failed for vial {vial_name} "
+                    f"(template={contrast_file.name}): {result.stderr}"
+                )
             # Extract metrics for each volume
             for vol_idx in range(nvols):
                 if nvols == 1:
@@ -637,6 +699,10 @@ class PhantomProcessor:
                 ]
 
                 result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0 or not result.stdout.strip():
+                    raise RuntimeError(
+                        f"mrstats failed for vial {vial_name}: {result.stderr}"
+                    )
                 values = result.stdout.strip().split()
 
                 metrics_data["mean"][vial_name].append(float(values[0]))
@@ -761,12 +827,9 @@ class PhantomProcessor:
 
                     cmd = [
                         "mrgrid",
-                        str(vial_mask),
                         "-template",
                         str(contrast_file),
-                        "-interp",
-                        "nearest",
-                        "-quiet",
+                        str(vial_mask),
                         "regrid",
                         regridded,
                         "-force",
@@ -831,7 +894,7 @@ class PhantomProcessor:
 
         # Generate parametric map plots (IR and TE)
         self._generate_parametric_plots(
-            contrast_files, metrics_dir, tmp_vial_dir, session_name
+            contrast_files, metrics_dir, tmp_vial_dir, session_name, vial_dir=vial_dir
         )
 
     def _generate_parametric_plots(
@@ -840,7 +903,10 @@ class PhantomProcessor:
         metrics_dir: Path,
         tmp_vial_dir: Path,
         session_name: str,
+        vial_dir: Path = None,
     ):
+        if vial_dir is None:
+            vial_dir = metrics_dir.parent / "vial_segmentations"
         """Generate T1/T2 parametric map plots"""
 
         import re as _re
@@ -870,7 +936,6 @@ class PhantomProcessor:
                 # Create combined ROI overlay for IR
                 first_ir = ir_contrasts[0]
                 roi_overlay_file = str(tmp_vial_dir / "ir_VialsCombined.nii.gz")
-                vial_dir = metrics_dir.parent / "vial_segmentations"
                 vial_masks_list = list(vial_dir.glob("*.nii.gz"))
 
                 if vial_masks_list:
@@ -884,12 +949,9 @@ class PhantomProcessor:
 
                         cmd = [
                             "mrgrid",
-                            str(vial_mask),
                             "-template",
                             str(first_ir),
-                            "-interp",
-                            "nearest",
-                            "-quiet",
+                            str(vial_mask),
                             "regrid",
                             regridded,
                             "-force",
@@ -979,7 +1041,6 @@ class PhantomProcessor:
                 # Create combined ROI overlay for TE
                 first_te = te_contrasts[0]
                 roi_overlay_file = str(tmp_vial_dir / "te_VialsCombined.nii.gz")
-                vial_dir = metrics_dir.parent / "vial_segmentations"
                 vial_masks_list = list(vial_dir.glob("*.nii.gz"))
 
                 if vial_masks_list:
@@ -993,12 +1054,9 @@ class PhantomProcessor:
 
                         cmd = [
                             "mrgrid",
-                            str(vial_mask),
                             "-template",
                             str(first_te),
-                            "-interp",
-                            "nearest",
-                            "-quiet",
+                            str(vial_mask),
                             "regrid",
                             regridded,
                             "-force",
@@ -1109,13 +1167,22 @@ class PhantomProcessor:
         tmp_dir = output_dir / "tmp"
 
         if measurement_space == "template":
-            vial_dir = output_dir / "vial_segmentations_template_space"
-            metrics_dir = output_dir / "metrics_template_space"
+            transformed_images_dir = output_dir / "transformed_images"
+            vial_dir = None
+            metrics_dir = None
         else:
             vial_dir = output_dir / "vial_segmentations"
             metrics_dir = output_dir / "metrics"
+            transformed_images_dir = None
 
-        for d in [tmp_dir, vial_dir, metrics_dir]:
+        dirs_to_create = [tmp_dir]
+        if transformed_images_dir:
+            dirs_to_create.append(transformed_images_dir)
+        if vial_dir:
+            dirs_to_create.append(vial_dir)
+        if metrics_dir:
+            dirs_to_create.append(metrics_dir)
+        for d in dirs_to_create:
             d.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'='*60}")
@@ -1177,6 +1244,13 @@ class PhantomProcessor:
                 "-force",
             ]
             subprocess.run(cmd, check=True, capture_output=True)
+            # Also copy to transformed_images/ using the original filename
+            import shutil as _shutil
+
+            _shutil.copy2(
+                input_template_space,
+                str(transformed_images_dir / input_path.name),
+            )
             print(f"  ✓ Saved input image in template space")
 
         # Gather all contrast images in the session folder
@@ -1185,17 +1259,18 @@ class PhantomProcessor:
         if measurement_space == "template":
             # ------------------------------------------------------------------
             # TEMPLATE-SPACE MODE
-            # Each contrast image is forward-transformed into template space.
-            # The native template vial masks are used directly — no mask
-            # interpolation into subject space is required.
+            # All contrasts are forward-transformed to template space using the
+            # ANTs affine (linear interpolation) and saved to transformed_images/.
+            # No metrics or plots are generated — use subject-space mode for that.
             # ------------------------------------------------------------------
-            print("\nStep 2: Transforming contrast images to template space")
+            print("\nStep 2: Transforming all contrasts to template space")
             print(f"  Found {len(contrast_files)} contrast image(s)")
 
             tmp_template_space_dir = tmp_dir / "template_space_contrasts"
             tmp_template_space_dir.mkdir(parents=True, exist_ok=True)
 
-            warped_contrast_files = []
+            import shutil as _shutil
+
             for contrast_file in contrast_files:
                 print(f"  Transforming: {contrast_file.name}")
                 warped_path = self._transform_contrast_to_template_space(
@@ -1205,29 +1280,42 @@ class PhantomProcessor:
                     iteration=iteration,
                     tmp_dir=tmp_template_space_dir,
                 )
-                warped_contrast_files.append(Path(warped_path))
+                _shutil.copy2(
+                    warped_path,
+                    str(transformed_images_dir / contrast_file.name),
+                )
                 print(f"    ✓ {contrast_file.name} → template space")
 
-            # Use the original template vial masks directly
-            template_vial_masks = [str(m) for m in self.vial_masks]
-            print(
-                f"\nStep 3: Extracting metrics from template-space contrasts "
-                f"using {len(template_vial_masks)} template vial masks"
-            )
+            print(f"\n  ✓ All contrasts saved to: {transformed_images_dir}")
 
-            all_metrics = {}
-            for warped_contrast in warped_contrast_files:
-                metrics_data = self._extract_metrics_from_contrast(
-                    contrast_file=warped_contrast,
-                    vial_masks=template_vial_masks,
-                    output_metrics_dir=metrics_dir,
-                    session_name=session_name,
-                )
-                all_metrics[warped_contrast.name] = metrics_data
+            # Clean up and return — no metrics or plots for template-space mode
+            print("\nStep 3: Cleaning up temporary directories")
+            import shutil
 
-            # Store the template vial masks path for plot generation
-            active_vial_dir = self.vial_dir
-            active_contrast_files = warped_contrast_files
+            for temp_dir in [
+                tmp_dir,
+                output_dir / "tmp_vials",
+                output_dir / "tmp_vols",
+            ]:
+                if temp_dir.exists():
+                    try:
+                        shutil.rmtree(temp_dir)
+                        print(f"  ✓ Removed: {temp_dir.name}")
+                    except Exception as e:
+                        print(f"  ⚠ Could not remove {temp_dir.name}: {e}")
+
+            print(f"\n{'='*60}")
+            print(f"✓ Session {session_name} complete!")
+            print(f"  Transformed images: {transformed_images_dir}")
+            print(f"{'='*60}\n")
+
+            return {
+                "session": session_name,
+                "output_dir": str(output_dir),
+                "transformed_images_dir": str(transformed_images_dir),
+                "measurement_space": measurement_space,
+                "iteration": iteration,
+            }
 
         else:
             # ------------------------------------------------------------------
