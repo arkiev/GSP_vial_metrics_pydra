@@ -1151,9 +1151,9 @@ class PhantomProcessor:
         tmp_dir = output_dir / "tmp"
         vial_dir = output_dir / "vial_segmentations"
         metrics_dir = output_dir / "metrics"
-        transformed_images_dir = output_dir / "transformed_images"
+        images_template_space_dir = output_dir / "images_template_space"
 
-        for d in [tmp_dir, vial_dir, metrics_dir, transformed_images_dir]:
+        for d in [tmp_dir, vial_dir, metrics_dir, images_template_space_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'='*60}")
@@ -1198,16 +1198,7 @@ class PhantomProcessor:
         subprocess.run(cmd, check=True, capture_output=True)
         print(f"  ✓ Saved template in scanner space")
 
-        # Save the input image warped into template space (registration QC)
         import shutil as _shutil
-
-        input_template_space = str(output_dir / "InputImage_TemplateSpace.nii.gz")
-        cmd = ["mrconvert", "-quiet", warped, input_template_space, "-force"]
-        subprocess.run(cmd, check=True, capture_output=True)
-        _shutil.copy2(
-            input_template_space, str(transformed_images_dir / input_path.name)
-        )
-        print(f"  ✓ Saved input image in template space")
 
         # Gather all contrast images in the session folder
         contrast_files = list(input_path.parent.glob("*.nii.gz"))
@@ -1251,7 +1242,7 @@ class PhantomProcessor:
         # ------------------------------------------------------------------
         # TEMPLATE-SPACE PIPELINE
         # All contrasts are forward-transformed to template space (linear
-        # interpolation) and saved to transformed_images/.
+        # interpolation) and saved to images_template_space/.
         # ------------------------------------------------------------------
         print("\nStep 5: Transforming all contrasts to template space")
         tmp_template_space_dir = tmp_dir / "template_space_contrasts"
@@ -1266,9 +1257,11 @@ class PhantomProcessor:
                 iteration=iteration,
                 tmp_dir=tmp_template_space_dir,
             )
-            _shutil.copy2(warped_path, str(transformed_images_dir / contrast_file.name))
+            _shutil.copy2(
+                warped_path, str(images_template_space_dir / contrast_file.name)
+            )
             print(f"    ✓ {contrast_file.name} → template space")
-        print(f"  ✓ All contrasts saved to: {transformed_images_dir}")
+        print(f"  ✓ All contrasts saved to: {images_template_space_dir}")
 
         # Clean up
         print("\nStep 6: Cleaning up temporary directories")
@@ -1291,7 +1284,7 @@ class PhantomProcessor:
         print(f"✓ Session {session_name} complete!")
         print(f"  Metrics:              {metrics_dir}")
         print(f"  Vial masks:           {vial_dir}")
-        print(f"  Transformed images:   {transformed_images_dir}")
+        print(f"  Template-space images: {images_template_space_dir}")
         print(f"{'='*60}\n")
 
         return {
@@ -1299,7 +1292,7 @@ class PhantomProcessor:
             "output_dir": str(output_dir),
             "metrics_dir": str(metrics_dir),
             "vial_dir": str(vial_dir),
-            "transformed_images_dir": str(transformed_images_dir),
+            "images_template_space_dir": str(images_template_space_dir),
             "space_image": str(output_dir / "TemplatePhantom_ScannerSpace.nii.gz"),
             "iteration": iteration,
             "metrics": all_metrics,
