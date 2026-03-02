@@ -1,0 +1,91 @@
+title: "GSP Vial Metrics Pipeline"
+schema_version: "2.0"
+version: "2.0"
+base_image:
+  name: ubuntu
+  tag: "22.04"
+  package_manager: apt
+
+packages:
+  pip:
+    pydra: 1.0a6
+    pandas:
+    matplotlib:
+  neurodocker:
+    mrtrix3: 3.0.2
+    ants: 2.5.0
+
+authors:
+  - name: Arkiev D'Souza
+    email: arkiev.dsouza@sydney.edu.au
+
+docs:
+  info_url: "https://github.com/arkiev/GSP_vial_metrics_pydra"
+  description: |
+    Automated quality control pipeline for MRI phantom analysis across the
+    National Imaging Facility (NIF) network. Processes standardised phantoms
+    containing vials with known T1 and T2 relaxation properties to validate
+    MRI scanner performance and enable harmonised multi-site neuroimaging studies.
+
+    The pipeline performs rigid-body registration of a T1 MPRAGE phantom image
+    to a template phantom, with iterative orientation correction (up to 120
+    attempts). Vial masks are inverse-transformed into subject space and used
+    to extract signal metrics (mean, median, std, min, max) from all contrast
+    images in the session folder (IR, TE, MPRAGE). Publication-quality plots
+    are generated including T1 inversion recovery and T2 echo-time parametric
+    maps with curve fitting and ROI overlays.
+
+    All contrast images are also forward-transformed to template space and saved
+    for multi-site harmonisation QC.
+
+    Outputs per session:
+      - metrics/                  CSV files and plots (subject space)
+      - vial_segmentations/       Vial masks in subject space
+      - images_template_space/    All contrasts forward-transformed to template space
+      - TemplatePhantom_ScannerSpace.nii.gz
+
+commands:
+  single:
+    task: pydra_phantom_iterative:process_phantom_session
+    operates_on: medimage/session
+    sources:
+      T1wMPRAGE:
+        field: input_image
+        help: "T1-weighted MPRAGE NIfTI image used for phantom registration"
+    parameters:
+      TemplateDir:
+        field: template_dir
+        help: "Directory containing the template phantom image, vial masks, and rotation library"
+      RotationLib:
+        field: rotation_lib
+        help: "Path to the rotation library text file used for orientation correction"
+    configuration:
+      output_dir: /work/outputs
+
+  batch:
+    task: pydra_phantom_iterative:create_batch_workflow
+    operates_on: medimage/dataset
+    sources:
+      DataDir:
+        field: data_dir
+        help: "Root directory containing per-session subfolders, each with NIfTI contrast images"
+    parameters:
+      TemplateDir:
+        field: template_dir
+        help: "Directory containing the template phantom image, vial masks, and rotation library"
+      RotationLib:
+        field: rotation_lib
+        help: "Path to the rotation library text file used for orientation correction"
+      ImagePattern:
+        field: pattern
+        default: "*t1*mprage*.nii.gz"
+        help: "Glob pattern used to identify the primary registration image within each session folder"
+      Plugin:
+        field: plugin
+        default: "cf"
+        help: "Pydra execution plugin: 'cf' (concurrent futures, default) or 'serial'"
+    configuration:
+      output_dir: /work/outputs
+
+resources:
+  template-data: /template  # Template phantom, vial masks, rotation library
