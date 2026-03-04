@@ -1,0 +1,92 @@
+# DWI Processing Pipeline Configuration
+# =======================================
+# Usage:
+#   python dwi_processing.py --config config.yaml
+#
+# All parameters below can also be overridden on the command line:
+#   python dwi_processing.py --config config.yaml --scans-dir /new/path
+#
+# CLI flags always take priority over values set here.
+
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+
+# Path to the scans directory containing all acquisition subdirectories.
+# Expected subdirectory naming conventions:
+#   T1         : folder name contains "t1" (case-insensitive)
+#   Main DWI   : folder name does not match T1, ADC, FA, or PE-direction suffixes
+#   Forward PE : folder name ends with _A_P, _AP, _L_R, _LR, _S_I, or _SI
+#   Reverse PE : folder name ends with _P_A, _PA, _R_L, _RL, _I_S, or _IS
+scans_dir: /path/to/P000028/scans
+
+# Path to the parent output directory.
+# Each DWI series will produce a subdirectory inside this folder.
+# If not set, defaults to a folder named after the scans directory
+# in the current working directory.
+output_dir: /path/to/outputs
+
+# ---------------------------------------------------------------------------
+# Optional preprocessing steps (both default to false)
+# ---------------------------------------------------------------------------
+
+# Apply dwidenoise followed by mrdegibbs Gibbs ringing correction.
+# When true, output DWI is named: DWI_denoise_gibbs_preproc_biascorr.mif.gz
+# When false, output DWI is named: DWI_preproc_biascorr.mif.gz
+denoise_degibbs: false
+
+# Apply dwigradcheck to verify and correct gradient orientations before
+# mrconvert. Applied to the main DWI and to any PE pair images if present.
+gradcheck: false
+
+# ---------------------------------------------------------------------------
+# Readout time
+# ---------------------------------------------------------------------------
+
+# Total readout time (seconds) passed to dwifslpreproc via -readout_time.
+# If not set (or set to null), the value is read automatically from the
+# TotalReadoutTime field in the dcm2niix JSON sidecar.
+# Set this explicitly only if the JSON value is missing or incorrect.
+#
+# readout_time: 0.0342002
+readout_time: null
+
+# ---------------------------------------------------------------------------
+# Eddy options
+# ---------------------------------------------------------------------------
+
+# Options passed directly to FSL eddy via dwifslpreproc -eddy_options.
+# The string is passed as-is, so include leading space if needed.
+eddy_options: " --slm=linear"
+
+# ---------------------------------------------------------------------------
+# Notes on automatic behaviour
+# ---------------------------------------------------------------------------
+#
+# Phase encoding direction:
+#   Detected automatically from the DWI folder name (AP, PA, LR, RL, SI, IS).
+#
+# dwifslpreproc mode:
+#   Determined automatically from the number of volumes in the RPE image:
+#     rpe_none  : no reverse PE image found
+#     rpe_pair  : RPE image is a single volume
+#     rpe_split : RPE has >1 vol but fewer than DWI, with a matching FWD image
+#     rpe_all   : RPE has same number of volumes as DWI
+#
+# Mean b0 fallback:
+#   If no forward PE (A_P) image is found for rpe_pair mode, the mean b0
+#   is computed from the DWI image and used as the forward PE volume.
+#
+# PE pair matching (multiple DWI series):
+#   Each DWI is matched to its PE pair by longest common prefix of the
+#   acquisition name (series number prefix stripped). Falls back to a
+#   shared PE pair if no strong match is found.
+#
+# Output structure:
+#   <scans_dir_name>/
+#     <DWI_series_name>/
+#       ADC.nii.gz
+#       FA.nii.gz
+#       DWI_preproc_biascorr.mif.gz        (or DWI_denoise_gibbs_preproc_biascorr.mif.gz)
+#       T1_n4_in_DWI_space.nii.gz
+#       tmp/                               (all intermediate files)
