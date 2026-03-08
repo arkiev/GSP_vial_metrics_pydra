@@ -63,7 +63,7 @@ def common_prefix_len(a: str, b: str) -> int:
 
 
 def get_nvols(path: str) -> int:
-    """Return number of volumes using mrinfo -ndim."""
+    """Return number of volumes using mrinfo."""
     result = subprocess.run(
         ["mrinfo", path, "-ndim"], capture_output=True, text=True, check=True
     )
@@ -74,6 +74,30 @@ def get_nvols(path: str) -> int:
         ["mrinfo", path, "-size"], capture_output=True, text=True, check=True
     )
     return int(result2.stdout.strip().split()[-1])
+
+
+def read_bvals(bval_path: str) -> list:
+    """Read bval file and return list of float values. Returns [] if missing/empty."""
+    try:
+        with open(bval_path) as f:
+            content = f.read().strip()
+        if not content:
+            return []
+        return [float(v) for v in content.split()]
+    except Exception:
+        return []
+
+
+def has_nonzero_bvals(bval_path: str) -> bool:
+    """Return True if bval file exists, is non-empty, and contains non-zero values."""
+    vals = read_bvals(bval_path)
+    return bool(vals) and any(v > 10 for v in vals)  # threshold >10 to ignore rounding
+
+
+def all_zero_bvals(bval_path: str) -> bool:
+    """Return True if bval file exists and all values are effectively zero."""
+    vals = read_bvals(bval_path)
+    return bool(vals) and all(v <= 10 for v in vals)
 
 
 def get_readout_time(json_path: str, fallback: float = 0.0342002) -> float:
@@ -90,8 +114,36 @@ def get_readout_time(json_path: str, fallback: float = 0.0342002) -> float:
     return fallback
 
 
+def get_pe_from_json(json_path: str) -> tuple:
+    """
+    (#9) Fallback: read PhaseEncodingDirection from JSON sidecar and map to
+    MRtrix3-compatible direction string.
+    Returns (pe_dir, rpe_dir) or raises ValueError if not found/unrecognised.
+    """
+    mapping = {
+        "j-": ("AP", "PA"),
+        "j": ("PA", "AP"),
+        "i": ("LR", "RL"),
+        "i-": ("RL", "LR"),
+        "k": ("SI", "IS"),
+        "k-": ("IS", "SI"),
+    }
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+        ped = data.get("PhaseEncodingDirection", "").strip()
+        if ped in mapping:
+            return mapping[ped]
+    except Exception:
+        pass
+    raise ValueError(f"PhaseEncodingDirection not found or unrecognised in {json_path}")
+
+
 def detect_pe_direction(folder_name: str) -> tuple:
-    """Return (pe_dir, rpe_dir) from a folder name."""
+    """
+    Return (pe_dir, rpe_dir) from a folder name.
+    Raises ValueError if not found — caller should fall back to get_pe_from_json (#9).
+    """
     pairs = [
         (r"_AP(_|$)", "AP", "PA"),
         (r"_A_P(_|$)", "AP", "PA"),
@@ -110,151 +162,55 @@ def detect_pe_direction(folder_name: str) -> tuple:
         if re.search(pattern, folder_name, re.IGNORECASE):
             return pe, rpe
     raise ValueError(
-        f"Could not determine PE direction from: {folder_name}\n"
-        f"Expected one of: AP, PA, LR, RL, SI, IS (or underscore variants)"
+        f"Could not determine phase encoding direction from folder name: {folder_name}"
     )
 
 
-def is_pe_direction(name: str, directions: list) -> bool:
-    """Check if a folder name contains any of the given PE direction tags."""
-    for d in directions:
-        if re.search(rf"_{d}(_|$)", name, re.IGNORECASE):
-            return True
-        if re.search(rf"_{d[0]}_{d[1]}(_|$)", name, re.IGNORECASE):
-            return True
+# =============================================================================
+# Directory scanning constants
+# =============================================================================
+
+FWD_DIRS = ["AP", "LR", "SI", "A_P", "L_R", "S_I"]
+RPE_DIRS = ["PA", "RL", "IS", "P_A", "R_L", "I_S"]
+ALL_PE_DIRS = FWD_DIRS + RPE_DIRS
+
+
+def has_terminal_pe(name: str, directions: list) -> bool:
+    """
+    Returns True if a PE direction tag appears as the final token in the folder
+    name (nothing follows, or only a single short alphanumeric token with no
+    underscores). This identifies dedicated b0 PE images vs full DWI series.
+    """
+    for d_ in directions:
+        for pat in [rf"_{d_}$", rf"_{d_}_[A-Za-z0-9]{{1,10}}$"]:
+            if re.search(pat, name, re.IGNORECASE):
+                return True
+        # Underscore-separated variant (e.g. A_P, P_A)
+        if len(d_) == 3 and d_[1] == "_":
+            for pat in [
+                rf"_{d_[0]}_{d_[2]}$",
+                rf"_{d_[0]}_{d_[2]}_[A-Za-z0-9]{{1,10}}$",
+            ]:
+                if re.search(pat, name, re.IGNORECASE):
+                    return True
     return False
 
 
-# =============================================================================
-# Directory scanning and workflow planning
-# =============================================================================
-
-ALL_PE_DIRS = [
-    "AP",
-    "PA",
-    "LR",
-    "RL",
-    "SI",
-    "IS",
-    "A_P",
-    "P_A",
-    "L_R",
-    "R_L",
-    "S_I",
-    "I_S",
-]
-FWD_DIRS = ["AP", "LR", "SI", "A_P", "L_R", "S_I"]
-RPE_DIRS = ["PA", "RL", "IS", "P_A", "R_L", "I_S"]
-
-
-def scan_directory(scans_dir: str) -> dict:
+def get_acq_stem_and_suffix(folder_name: str) -> tuple:
     """
-    Classify all subdirectories in scans_dir into:
-      - t1_dirs: list of T1 directories (sorted by series number)
-      - dwi_dirs: list of main DWI directories
-      - fwd_pe_dirs: list of forward PE (b0 or full) directories
-      - rpe_dirs: list of reverse PE (b0 or full) directories
-      - ignored: list of skipped directories (ADC, FA scanner maps)
+    Split acquisition name into (prefix, suffix) around the PE direction tag.
+    Both must match exactly for two series to be considered valid AP/PA partners
+    (#14 — prevents pairing of MONO/BIPOLAR variants or different parameters).
 
-    PE direction tags are matched anywhere in the folder name, not just at end.
-    """
-    scans_path = Path(scans_dir)
-    t1_dirs = []
-    dwi_dirs = []
-    fwd_pe_dirs = []
-    rpe_dirs = []
-    ignored = []
-
-    for d in sorted(scans_path.iterdir()):
-        if not d.is_dir():
-            continue
-        name = d.name
-
-        # T1: contains "t1" (case-insensitive)
-        if re.search(r"t1", name, re.IGNORECASE):
-            t1_dirs.append(str(d))
-            continue
-
-        # Skip scanner-derived maps
-        if re.search(r"_(ADC|FA)$", name, re.IGNORECASE):
-            ignored.append(str(d))
-            continue
-
-        # Only classify further if this looks like a DWI acquisition
-        if not re.search(r"(_diff_|_DWI_)", name, re.IGNORECASE):
-            ignored.append(str(d))
-            continue
-
-        # Distinguish main DWI from PE pair images.
-        # PE pair images are identified by having a PE direction tag as the
-        # FINAL meaningful token (nothing substantial after it).
-        # Main DWI acquisitions have additional parameter suffixes after the
-        # PE direction tag (e.g. _BW3720, _ESpt57, _BIPOLAR).
-        #
-        # Strategy: check if the PE direction tag appears with only short/numeric
-        # suffixes after it (<=15 chars). If so it's a PE pair image; otherwise
-        # it's a main DWI.
-        def has_terminal_pe(n, directions):
-            """
-            Returns True if a PE direction tag appears as the last meaningful
-            token in the folder name, i.e. nothing follows it, or only a
-            short purely alphanumeric suffix (no underscores — one token only).
-            This prevents '_AP_ORIG_P_A' from matching as a forward PE image.
-            """
-            for d_ in directions:
-                # Bare direction tag at end, with optional single short alphanumeric token
-                for pat in [rf"_{d_}$", rf"_{d_}_[A-Za-z0-9]{{1,10}}$"]:
-                    if re.search(pat, n, re.IGNORECASE):
-                        return True
-                # Underscore-separated direction (e.g. A_P, P_A) at end
-                if len(d_) == 3 and d_[1] == "_":
-                    for pat in [
-                        rf"_{d_[0]}_{d_[2]}$",
-                        rf"_{d_[0]}_{d_[2]}_[A-Za-z0-9]{{1,10}}$",
-                    ]:
-                        if re.search(pat, n, re.IGNORECASE):
-                            return True
-            return False
-
-        if has_terminal_pe(name, FWD_DIRS):
-            fwd_pe_dirs.append(str(d))
-            continue
-
-        if has_terminal_pe(name, RPE_DIRS):
-            rpe_dirs.append(str(d))
-            continue
-
-        # Has a PE direction tag mid-name with substantial suffixes: main DWI
-        dwi_dirs.append(str(d))
-
-    if not t1_dirs:
-        raise ValueError(f"Could not identify any T1 directory in {scans_dir}")
-    if not dwi_dirs:
-        raise ValueError(f"Could not identify any DWI directories in {scans_dir}")
-
-    # Detect AP/PA (rpe_all) pairs among the main DWI dirs
-    dwi_dirs, rpe_all_map = match_ap_pa_pairs(dwi_dirs)
-
-    return {
-        "t1_dirs": t1_dirs,
-        "dwi_dirs": sorted(dwi_dirs),
-        "fwd_pe_dirs": fwd_pe_dirs,
-        "rpe_dirs": rpe_dirs,
-        "rpe_all_map": rpe_all_map,  # {fwd_path: rpe_path} for rpe_all pairs
-        "ignored": ignored,
-    }
-
-
-def get_acq_stem(folder_name: str) -> str:
-    """
-    Extract the acquisition stem for AP/PA matching by:
-    1. Stripping the leading series number
-    2. Removing the PE direction tag and everything after it
     e.g. '12-ep2d_diff__FREE30DIR_b1000_x7b0_Ghost_R_AP_ESpt54_BW2264_BIPOLAR'
-      -> 'ep2d_diff__FREE30DIR_b1000_x7b0_Ghost_R'
+      -> prefix: 'ep2d_diff__FREE30DIR_b1000_x7b0_Ghost_R'
+         suffix: 'ESpt54_BW2264_BIPOLAR'
+
+    Returns (full_name_no_series, "", "") if no PE direction tag found.
     """
     name = strip_series_number(folder_name)
-    all_dirs = [
+    # Try longer variants first (A_P before AP) to avoid partial matches
+    all_dirs_ordered = [
         "A_P",
         "P_A",
         "L_R",
@@ -268,71 +224,295 @@ def get_acq_stem(folder_name: str) -> str:
         "SI",
         "IS",
     ]
-    for d in all_dirs:
+    for d in all_dirs_ordered:
         m = re.search(rf"_({re.escape(d)})(_|$)", name, re.IGNORECASE)
         if m:
-            return name[: m.start()]
-    return name
+            prefix = name[: m.start()]
+            # suffix is everything after the direction tag (and the following _)
+            suffix_start = m.end()
+            suffix = name[suffix_start:] if suffix_start < len(name) else ""
+            return prefix, suffix
+    return name, ""
 
 
-def match_ap_pa_pairs(dwi_dirs: list) -> tuple:
+# =============================================================================
+# DICOM conversion helper (used in planning stage)
+# =============================================================================
+
+
+def convert_dicom_to_nii(dicom_dir: str, out_dir: str) -> dict:
     """
-    Scan dwi_dirs for AP/PA (or LR/RL, SI/IS) pairs sharing the same
-    acquisition stem. The forward-direction series stays in dwi_dirs as
-    the main DWI; the reverse-direction series is returned in a
-    rpe_all_map dict: {fwd_dir_path: rpe_dir_path}.
-
-    Returns (filtered_dwi_dirs, rpe_all_map).
+    Run dcm2niix on a DICOM directory, returning a dict with paths to:
+      nii, json, bvec, bval
+    Returns empty strings for missing files.
     """
-    stem_map = {}
-    for d in dwi_dirs:
+    os.makedirs(out_dir, exist_ok=True)
+    subprocess.run(
+        ["dcm2niix", "-o", out_dir, "-f", "%p", "-z", "y", dicom_dir],
+        check=True,
+        capture_output=True,
+    )
+    niis = sorted(Path(out_dir).glob("*.nii.gz"))
+    if not niis:
+        raise FileNotFoundError(f"No NIfTI produced from DICOM: {dicom_dir}")
+    nii = str(niis[0])
+    base = nii.replace(".nii.gz", "")
+    return {
+        "nii": nii,
+        "json": base + ".json" if Path(base + ".json").exists() else "",
+        "bvec": base + ".bvec" if Path(base + ".bvec").exists() else "",
+        "bval": base + ".bval" if Path(base + ".bval").exists() else "",
+    }
+
+
+# =============================================================================
+# Directory scanning and candidate classification
+# =============================================================================
+
+
+def scan_directory(scans_dir: str) -> dict:
+    """
+    First pass: classify subdirectories into t1_dirs, candidate_dwi (all series
+    containing _diff_ or _DWI_), and ignored. PE classification is PROVISIONAL
+    at this stage — final assignment happens after DICOM conversion in
+    classify_candidates().
+    """
+    scans_path = Path(scans_dir)
+    t1_dirs = []
+    candidate_dwi = []  # all _diff_ / _DWI_ series, including PE images
+    ignored = []
+
+    for d in sorted(scans_path.iterdir()):
+        if not d.is_dir():
+            continue
+        name = d.name
+
+        # T1
+        if re.search(r"t1", name, re.IGNORECASE):
+            t1_dirs.append(str(d))
+            continue
+
+        # Skip scanner-derived maps
+        if re.search(r"_(ADC|FA)$", name, re.IGNORECASE):
+            ignored.append(str(d))
+            continue
+
+        # Only consider DWI-like acquisitions
+        if not re.search(r"(_diff_|_DWI_)", name, re.IGNORECASE):
+            ignored.append(str(d))
+            continue
+
+        candidate_dwi.append(str(d))
+
+    if not t1_dirs:
+        raise ValueError(f"Could not identify any T1 directory in {scans_dir}")
+    if not candidate_dwi:
+        raise ValueError(f"Could not identify any DWI directories in {scans_dir}")
+
+    return {
+        "t1_dirs": t1_dirs,
+        "candidate_dwi": candidate_dwi,
+        "ignored": ignored,
+    }
+
+
+def convert_all_candidates(candidate_dwi: list, output_dir: str) -> dict:
+    """
+    (#18 ordering step 2) Convert all candidate DWI DICOMs upfront.
+    Returns a dict: {dicom_dir: {nii, json, bvec, bval}}
+    """
+    conversions = {}
+    for dicom_dir in candidate_dwi:
+        name = Path(dicom_dir).name
+        conv_dir = str(Path(output_dir) / name / "tmp" / "dwi_nii")
+        print(f"  Converting: {name}")
+        try:
+            result = convert_dicom_to_nii(dicom_dir, conv_dir)
+            conversions[dicom_dir] = result
+        except Exception as e:
+            print(f"  WARNING: DICOM conversion failed for {name}: {e}")
+            conversions[dicom_dir] = None
+    return conversions
+
+
+def classify_candidates(candidate_dwi: list, conversions: dict) -> dict:
+    """
+    (#18) Final classification of candidate DWI series into:
+      - dwi_dirs:     full DWI series eligible for tensor processing
+      - fwd_pe_dirs:  forward PE correction images (b0-only or low-volume)
+      - rpe_dirs:     reverse PE correction images (b0-only or low-volume)
+      - skipped:      list of (path, reason) tuples
+
+    Classification rules (applied in order after DICOM conversion):
+      1. No bvec/bval files → skip (#16)
+      2. All b-values zero → candidate PE correction image, classify by PE tag
+      3. Has non-zero b-values AND terminal PE tag → provisional PE image;
+         will be reclassified to dwi_dirs if volume count matches a partner
+      4. Has non-zero b-values, no terminal PE tag → dwi_dirs
+    """
+    dwi_dirs = []
+    fwd_pe_dirs = []
+    rpe_dirs = []
+    skipped = []
+    # pending: series with terminal PE tag and non-zero bvals — reclassified after pairing
+    pending_fwd = []
+    pending_rpe = []
+
+    for dicom_dir in candidate_dwi:
+        name = Path(dicom_dir).name
+        conv = conversions.get(dicom_dir)
+
+        if conv is None:
+            skipped.append((dicom_dir, "DICOM conversion failed"))
+            continue
+
+        bvec = conv["bvec"]
+        bval = conv["bval"]
+
+        # #16 — check bvec/bval exist and are non-empty
+        if not bvec or not bval or not Path(bvec).exists() or not Path(bval).exists():
+            skipped.append(
+                (dicom_dir, "no bvec/bval files — not a raw DWI acquisition")
+            )
+            continue
+        if not read_bvals(bval):
+            skipped.append((dicom_dir, "empty bval file — not a raw DWI acquisition"))
+            continue
+
+        is_b0_only = all_zero_bvals(bval)
+        terminal_fwd = has_terminal_pe(name, FWD_DIRS)
+        terminal_rpe = has_terminal_pe(name, RPE_DIRS)
+
+        if is_b0_only:
+            # All b-values zero: PE correction image candidate
+            if terminal_fwd:
+                fwd_pe_dirs.append(dicom_dir)
+            elif terminal_rpe:
+                rpe_dirs.append(dicom_dir)
+            else:
+                # No direction tag — note in plan but cannot use for correction
+                skipped.append(
+                    (
+                        dicom_dir,
+                        "all b-values zero and no phase encoding direction in folder name — "
+                        "cannot use for correction",
+                    )
+                )
+        else:
+            # Has non-zero b-values
+            if terminal_fwd:
+                pending_fwd.append(dicom_dir)
+            elif terminal_rpe:
+                pending_rpe.append(dicom_dir)
+            else:
+                dwi_dirs.append(dicom_dir)
+
+    return {
+        "dwi_dirs": dwi_dirs,
+        "fwd_pe_dirs": fwd_pe_dirs,
+        "rpe_dirs": rpe_dirs,
+        "pending_fwd": pending_fwd,  # terminal PE tag + non-zero bvals, needs pairing
+        "pending_rpe": pending_rpe,
+        "skipped": skipped,
+    }
+
+
+# =============================================================================
+# AP/PA pairing
+# =============================================================================
+
+
+def match_ap_pa_pairs(
+    dwi_dirs: list, pending_fwd: list, pending_rpe: list, conversions: dict
+) -> tuple:
+    """
+    (#14, #18) Detect AP/PA (rpe_all/rpe_split) pairs across dwi_dirs,
+    pending_fwd, and pending_rpe.
+
+    Pairing requires:
+      - Same acquisition prefix (everything before the PE direction tag)
+      - Same acquisition suffix (everything after the PE direction tag) — #14
+      - Opposing PE directions
+
+    Pending series with non-zero bvals that find a partner are moved to dwi_dirs.
+    Pending series that find no partner are moved to fwd_pe_dirs / rpe_dirs.
+
+    Returns:
+      (dwi_dirs, fwd_pe_dirs, rpe_dirs, rpe_all_map, tie_warnings)
+      rpe_all_map: {fwd_path: rpe_path}
+      tie_warnings: list of (pe_image_path, [matched_dwi_paths]) for #20
+    """
+    fwd_set = {"AP", "LR", "SI"}
+    rpe_set = {"PA", "RL", "IS"}
+
+    # Build stem map over all candidates (dwi + pending)
+    all_candidates = dwi_dirs + pending_fwd + pending_rpe
+    stem_map = {}  # (prefix, suffix) -> list of (path, pe_dir)
+    for d in all_candidates:
         name = Path(d).name
         try:
             pe, _ = detect_pe_direction(name)
         except ValueError:
             pe = None
-        stem = get_acq_stem(name)
-        stem_map.setdefault(stem, []).append((d, pe))
+        prefix, suffix = get_acq_stem_and_suffix(name)
+        key = (prefix, suffix)
+        stem_map.setdefault(key, []).append((d, pe))
 
-    fwd_dirs = []
     rpe_all_map = {}
+    tie_warnings = []
+    paired_paths = set()
 
-    fwd_set = {"AP", "LR", "SI"}
-    rpe_set = {"PA", "RL", "IS"}
-
-    for stem, entries in stem_map.items():
-        if len(entries) == 1:
-            fwd_dirs.append(entries[0][0])
-            continue
-
+    for (prefix, suffix), entries in stem_map.items():
         fwds = [(p, pe) for p, pe in entries if pe in fwd_set]
         rpes = [(p, pe) for p, pe in entries if pe in rpe_set]
 
-        if fwds and rpes:
-            for fwd_path, fwd_pe in fwds:
-                fwd_num = get_series_number(Path(fwd_path).name)
-                best_rpe = min(
-                    rpes,
-                    key=lambda x: abs(get_series_number(Path(x[0]).name) - fwd_num),
-                )
-                rpe_all_map[fwd_path] = best_rpe[0]
-                fwd_dirs.append(fwd_path)
-            matched_rpes = set(rpe_all_map.values())
-            for rpe_path, _ in rpes:
-                if rpe_path not in matched_rpes:
-                    fwd_dirs.append(rpe_path)
-        else:
-            for p, _ in entries:
-                fwd_dirs.append(p)
+        if not (fwds and rpes):
+            continue
 
-    return fwd_dirs, rpe_all_map
+        for fwd_path, _ in fwds:
+            fwd_num = get_series_number(Path(fwd_path).name)
+            # Find closest RPE by series number
+            best_rpe_path = min(
+                rpes, key=lambda x: abs(get_series_number(Path(x[0]).name) - fwd_num)
+            )[0]
+            rpe_all_map[fwd_path] = best_rpe_path
+            paired_paths.add(fwd_path)
+            paired_paths.add(best_rpe_path)
+
+            # #20 — check for tie (multiple equal-prefix matches)
+            if len(fwds) > 1 or len(rpes) > 1:
+                tie_warnings.append((fwd_path, [p for p, _ in rpes]))
+
+    # Move paired pending series into dwi_dirs; unpaired pending into PE dirs
+    final_dwi = list(dwi_dirs)
+    final_fwd = list(conversions.get("fwd_pe_dirs", []))
+    final_rpe = list(conversions.get("rpe_dirs", []))
+
+    for p in pending_fwd:
+        if p in paired_paths:
+            final_dwi.append(p)
+        else:
+            final_fwd.append(p)
+
+    for p in pending_rpe:
+        if p in paired_paths:
+            # PA partner of a paired series — recorded in rpe_all_map, not in dwi_dirs
+            pass
+        else:
+            final_rpe.append(p)
+
+    return sorted(final_dwi), final_fwd, final_rpe, rpe_all_map, tie_warnings
+
+
+# =============================================================================
+# T1 and PE assignment helpers
+# =============================================================================
 
 
 def assign_t1(dwi_name: str, t1_dirs: list) -> str:
     """
-    Assign the correct T1 to a DWI series.
-    Rule: the T1 with the largest series number that is still less than
-    the DWI series number. Falls back to the first T1 if none precedes it.
+    Assign the nearest preceding T1 by series number.
+    Falls back to the first T1 if none precedes the DWI.
     """
     dwi_num = get_series_number(dwi_name)
     best = None
@@ -345,24 +525,69 @@ def assign_t1(dwi_name: str, t1_dirs: list) -> str:
     return best if best is not None else t1_dirs[0]
 
 
-def find_best_pe_match(dwi_name: str, pe_dirs: list) -> str:
+def find_best_pe_match(dwi_name: str, pe_dirs: list) -> tuple:
     """
-    Match a PE directory to a DWI by longest common prefix of acquisition
-    name (series number stripped). Falls back to first available if no
-    strong match (>10 chars).
+    (#19, #20) Match a PE directory to a DWI by longest common prefix.
+    When multiple PE dirs tie, break by nearest series number.
+
+    Returns (best_dir, tie_warning) where tie_warning is True if multiple
+    dirs shared the same best prefix length.
     """
     dwi_stem = strip_series_number(dwi_name)
-    best_dir = None
+    dwi_num = get_series_number(dwi_name)
     best_len = 0
+    best_dirs = []
+
     for d in pe_dirs:
         pe_stem = strip_series_number(Path(d).name)
         length = common_prefix_len(dwi_stem, pe_stem)
         if length > best_len:
             best_len = length
-            best_dir = d
-    if best_len > 10 and best_dir is not None:
-        return best_dir
-    return pe_dirs[0] if pe_dirs else None
+            best_dirs = [d]
+        elif length == best_len and length > 0:
+            best_dirs.append(d)
+
+    if not best_dirs or best_len <= 10:
+        # Weak match — fall back to nearest series number
+        best_dirs = pe_dirs
+        tie = len(pe_dirs) > 1
+    else:
+        tie = len(best_dirs) > 1
+
+    # Break tie by nearest series number
+    best = min(best_dirs, key=lambda d: abs(get_series_number(Path(d).name) - dwi_num))
+    return best, tie
+
+
+# =============================================================================
+# Plan construction
+# =============================================================================
+
+
+def resolve_pe_direction(dwi_name: str, dwi_json: str) -> tuple:
+    """
+    (#9) Try to determine PE direction from folder name first.
+    Fall back to JSON sidecar if not found. Returns (pe_dir, rpe_dir, source)
+    where source is 'folder_name' or 'json_sidecar'.
+    Raises ValueError if neither source yields a direction.
+    """
+    try:
+        pe_dir, rpe_dir = detect_pe_direction(dwi_name)
+        return pe_dir, rpe_dir, "folder_name"
+    except ValueError:
+        pass
+
+    if dwi_json and Path(dwi_json).exists():
+        try:
+            pe_dir, rpe_dir = get_pe_from_json(dwi_json)
+            return pe_dir, rpe_dir, "json_sidecar"
+        except ValueError:
+            pass
+
+    raise ValueError(
+        f"Could not determine phase encoding direction for {dwi_name} "
+        f"from folder name or JSON sidecar."
+    )
 
 
 def plan_workflow(
@@ -371,84 +596,136 @@ def plan_workflow(
     fwd_pe_dirs: list,
     rpe_dirs: list,
     rpe_all_map: dict,
+    tie_warnings: list,
+    conversions: dict,
     cfg: dict,
 ) -> dict:
     """
-    Plan the full workflow for a single DWI series.
-    Performs DICOM conversion to count volumes and determine preproc mode.
-    Returns a plan dict describing every step to be executed.
+    Build a complete plan dict for a single DWI series.
+    All DICOM conversion has already been done — we use results from conversions.
     """
     dwi_name = Path(dwi_dir).name
-    pe_dir, rpe_dir = detect_pe_direction(dwi_name)
+    conv = conversions[dwi_dir]
+    dwi_nii = conv["nii"]
+    dwi_json = conv["json"]
+    dwi_bvec = conv["bvec"]
+    dwi_bval = conv["bval"]
+    dwi_nvols = get_nvols(dwi_nii)
 
-    t1_dir = assign_t1(dwi_name, t1_dirs)
-
-    # Check if this DWI has a full-volume PA partner (rpe_all)
-    rpe_all_partner = rpe_all_map.get(dwi_dir)
-
-    # For rpe_all pairs, use the partner as the RPE; ignore b0 PE images
-    if rpe_all_partner:
-        fwd_pe_dir = None  # b0 FWD PE not needed for rpe_all
-        rpe_dir_path = rpe_all_partner
-    else:
-        fwd_pe_dir = find_best_pe_match(dwi_name, fwd_pe_dirs) if fwd_pe_dirs else None
-        rpe_dir_path = find_best_pe_match(dwi_name, rpe_dirs) if rpe_dirs else None
-
-    do_denoise = cfg.get("denoise_degibbs", False)
-    do_gradcheck = cfg.get("gradcheck", False)
-    readout_time_override = cfg.get("readout_time", None)
-    eddy_options = cfg.get("eddy_options", " --slm=linear")
-
-    # Determine preproc mode from volume counts
-    # We need to do a quick dcm2niix to NIfTI to count volumes.
-    # This is done in a scratch dir that will be reused by the main pipeline.
     out_dir = str(Path(cfg["output_dir"]) / dwi_name)
     tmp_dir = str(Path(out_dir) / "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # Convert DWI and RPE DICOMs temporarily to count volumes
-    dwi_conv_dir = str(Path(tmp_dir) / "dwi_nii")
-    rpe_conv_dir = str(Path(tmp_dir) / "rpe_nii") if rpe_dir_path else None
-    fwd_conv_dir = str(Path(tmp_dir) / "fwd_pe_nii") if fwd_pe_dir else None
+    # T1 assignment
+    t1_dir = assign_t1(dwi_name, t1_dirs)
 
-    os.makedirs(dwi_conv_dir, exist_ok=True)
-    subprocess.run(
-        ["dcm2niix", "-o", dwi_conv_dir, "-f", "%p", "-z", "y", dwi_dir],
-        check=True,
-        capture_output=True,
-    )
+    # PE direction (#9)
+    warnings = []
+    try:
+        pe_dir, rpe_dir, pe_source = resolve_pe_direction(dwi_name, dwi_json)
+    except ValueError as e:
+        raise ValueError(str(e))
 
-    dwi_niis = sorted(Path(dwi_conv_dir).glob("*.nii.gz"))
-    if not dwi_niis:
-        raise FileNotFoundError(f"No NIfTI produced from DWI DICOM: {dwi_dir}")
-    dwi_nii = str(dwi_niis[0])
-    dwi_nvols = get_nvols(dwi_nii)
+    if pe_source == "json_sidecar":
+        warnings.append(
+            f"Phase encoding direction ({pe_dir}) inferred from JSON sidecar "
+            f"— not found in folder name. Please verify."
+        )
+
+    # RPE assignment
+    rpe_all_partner = rpe_all_map.get(dwi_dir)
 
     rpe_nii = None
     rpe_nvols = 0
-    if rpe_dir_path:
-        os.makedirs(rpe_conv_dir, exist_ok=True)
-        subprocess.run(
-            ["dcm2niix", "-o", rpe_conv_dir, "-f", "%p", "-z", "y", rpe_dir_path],
-            check=True,
-            capture_output=True,
-        )
-        rpe_niis = sorted(Path(rpe_conv_dir).glob("*.nii.gz"))
-        if rpe_niis:
-            rpe_nii = str(rpe_niis[0])
+    fwd_pe_nii = None
+    fwd_pe_dir_used = None
+    rpe_dir_path = None
+
+    if rpe_all_partner:
+        # rpe_all: full-volume PA partner
+        rpe_dir_path = rpe_all_partner
+        rpe_conv = conversions.get(rpe_all_partner)
+        if rpe_conv:
+            rpe_nii = rpe_conv["nii"]
             rpe_nvols = get_nvols(rpe_nii)
 
-    fwd_pe_nii = None
-    if fwd_pe_dir:
-        os.makedirs(fwd_conv_dir, exist_ok=True)
-        subprocess.run(
-            ["dcm2niix", "-o", fwd_conv_dir, "-f", "%p", "-z", "y", fwd_pe_dir],
-            check=True,
-            capture_output=True,
-        )
-        fwd_niis = sorted(Path(fwd_conv_dir).glob("*.nii.gz"))
-        if fwd_niis:
-            fwd_pe_nii = str(fwd_niis[0])
+        # Check for rpe_all vs rpe_split warning
+        rpe_all_warning = None
+        if rpe_nvols == dwi_nvols:
+            rpe_all_warning = (
+                f"{dwi_name} and {Path(rpe_all_partner).name} have equal volumes "
+                f"({dwi_nvols}). Assuming rpe_all (full repeats). If directions are "
+                f"split across PE directions, set mode: rpe_split in config YAML."
+            )
+            warnings.append(rpe_all_warning)
+
+        fwd_pe_dir_used = None  # b0 PE images not needed
+
+    else:
+        # Use b0 PE correction images
+        rpe_match = None
+        rpe_tie = False
+        if rpe_dirs:
+            rpe_match, rpe_tie = find_best_pe_match(dwi_name, rpe_dirs)
+
+        fwd_match = None
+        fwd_tie = False
+        if fwd_pe_dirs:
+            fwd_match, fwd_tie = find_best_pe_match(dwi_name, fwd_pe_dirs)
+
+        rpe_dir_path = rpe_match
+        fwd_pe_dir_used = fwd_match
+
+        # #20 — tie warnings
+        if rpe_tie and rpe_match:
+            warnings.append(
+                f"{Path(rpe_match).name} matched equally to multiple DWI series. "
+                f"Assigned by nearest series number. If incorrect, consider adding "
+                f"a distinguishing suffix (e.g. _repeat) to the second acquisition "
+                f"block and its correction pair."
+            )
+        if fwd_tie and fwd_match:
+            warnings.append(
+                f"{Path(fwd_match).name} matched equally to multiple DWI series. "
+                f"Assigned by nearest series number."
+            )
+
+        # Convert RPE if available
+        if rpe_dir_path:
+            rpe_conv_dir = str(Path(tmp_dir) / "rpe_nii")
+            rpe_conv = conversions.get(rpe_dir_path)
+            if rpe_conv is None:
+                # Convert now if not already done
+                rpe_conv = convert_dicom_to_nii(rpe_dir_path, rpe_conv_dir)
+                conversions[rpe_dir_path] = rpe_conv
+            rpe_nii = rpe_conv["nii"]
+            rpe_nvols = get_nvols(rpe_nii)
+
+        # Convert FWD PE if available
+        if fwd_pe_dir_used:
+            fwd_conv_dir = str(Path(tmp_dir) / "fwd_pe_nii")
+            fwd_conv = conversions.get(fwd_pe_dir_used)
+            if fwd_conv is None:
+                fwd_conv = convert_dicom_to_nii(fwd_pe_dir_used, fwd_conv_dir)
+                conversions[fwd_pe_dir_used] = fwd_conv
+            fwd_pe_nii = fwd_conv["nii"]
+
+        # #17 — orphaned RPE handling
+        if rpe_dir_path and not fwd_pe_dir_used:
+            if rpe_nvols == 1:
+                warnings.append(
+                    f"{Path(rpe_dir_path).name} has no matching forward PE partner. "
+                    f"Will use mean b0 from main DWI as forward PE image (rpe_pair)."
+                )
+            elif rpe_nvols > 1:
+                warnings.append(
+                    f"{Path(rpe_dir_path).name} has no matching forward PE partner "
+                    f"and RPE has multiple volumes. Cannot use for correction. "
+                    f"Falling back to rpe_none."
+                )
+                rpe_dir_path = None
+                rpe_nii = None
+                rpe_nvols = 0
 
     # Determine preproc mode
     if rpe_nii is None:
@@ -460,37 +737,61 @@ def plan_workflow(
     else:
         preproc_mode = "rpe_pair"
 
+    # #21 — note unused PE images
+    notes = []
+    if rpe_all_partner:
+        for d in fwd_pe_dirs + rpe_dirs:
+            notes.append(f"{Path(d).name} — not used (DWI series has rpe_all partner)")
+
     # Resolve readout time
-    dwi_json = dwi_nii.replace(".nii.gz", ".json")
+    readout_time_override = cfg.get("readout_time", None)
     if readout_time_override is not None:
         readout_time = float(readout_time_override)
         readout_time_source = "config override"
-    elif Path(dwi_json).exists():
+    elif dwi_json and Path(dwi_json).exists():
         readout_time = get_readout_time(dwi_json)
-        readout_time_source = f"JSON ({dwi_json})"
+        readout_time_source = f"JSON ({Path(dwi_json).name})"
     else:
         readout_time = 0.0342002
         readout_time_source = "fallback (no JSON found)"
 
-    # Output filename reflects steps applied
-    if do_denoise:
-        dwi_preproc_name = "DWI_denoise_gibbs_preproc_biascorr.mif.gz"
-    else:
-        dwi_preproc_name = "DWI_preproc_biascorr.mif.gz"
+    do_denoise = cfg.get("denoise_degibbs", False)
+    do_gradcheck = cfg.get("gradcheck", False)
+    eddy_options = cfg.get("eddy_options", " --slm=linear")
+
+    dwi_preproc_name = (
+        "DWI_denoise_gibbs_preproc_biascorr.mif.gz"
+        if do_denoise
+        else "DWI_preproc_biascorr.mif.gz"
+    )
+
+    # Build paths for sidecar files
+    rpe_conv = conversions.get(rpe_dir_path) if rpe_dir_path else None
+    fwd_conv = conversions.get(fwd_pe_dir_used) if fwd_pe_dir_used else None
 
     return {
         "dwi_name": dwi_name,
         "dwi_dir": dwi_dir,
         "t1_dir": t1_dir,
-        "fwd_pe_dir": fwd_pe_dir,
+        "fwd_pe_dir": fwd_pe_dir_used,
         "rpe_dir_path": rpe_dir_path,
         "pe_dir": pe_dir,
         "rpe_dir": rpe_dir,
+        "pe_source": pe_source,
         "dwi_nii": dwi_nii,
+        "dwi_json": dwi_json,
+        "dwi_bvec": dwi_bvec,
+        "dwi_bval": dwi_bval,
         "dwi_nvols": dwi_nvols,
         "rpe_nii": rpe_nii,
+        "rpe_json": rpe_conv["json"] if rpe_conv else "",
+        "rpe_bvec": rpe_conv["bvec"] if rpe_conv else "",
+        "rpe_bval": rpe_conv["bval"] if rpe_conv else "",
         "rpe_nvols": rpe_nvols,
         "fwd_pe_nii": fwd_pe_nii,
+        "fwd_pe_json": fwd_conv["json"] if fwd_conv else "",
+        "fwd_pe_bvec": fwd_conv["bvec"] if fwd_conv else "",
+        "fwd_pe_bval": fwd_conv["bval"] if fwd_conv else "",
         "preproc_mode": preproc_mode,
         "readout_time": readout_time,
         "readout_time_src": readout_time_source,
@@ -500,22 +801,30 @@ def plan_workflow(
         "dwi_preproc_name": dwi_preproc_name,
         "out_dir": out_dir,
         "tmp_dir": tmp_dir,
-        "dwi_conv_dir": dwi_conv_dir,
-        "rpe_conv_dir": rpe_conv_dir,
-        "fwd_conv_dir": fwd_conv_dir,
+        "warnings": warnings,
+        "notes": notes,
     }
 
 
-def print_plan(plans: list):
-    """Print a human-readable workflow summary before execution begins."""
+def print_plan(plans: list, skipped: list):
+    """Print workflow summary including all warnings and notes."""
     print("\n" + "=" * 70)
     print("WORKFLOW PLAN")
     print("=" * 70)
+
+    if skipped:
+        print("\nSKIPPED SERIES:")
+        for path, reason in skipped:
+            print(f"  SKIPPED: {Path(path).name}")
+            print(f"           ({reason})")
+
     for p in plans:
         rpe_name = Path(p["rpe_dir_path"]).name if p["rpe_dir_path"] else "not found"
         fwd_name = Path(p["fwd_pe_dir"]).name if p["fwd_pe_dir"] else "not used"
+
         print(f"\nDWI series:       {p['dwi_name']}")
         print(f"  T1:             {Path(p['t1_dir']).name}")
+
         if p["preproc_mode"] == "rpe_all":
             print(f"  AP/PA pair:     {p['dwi_name']}  ({p['dwi_nvols']} vols)")
             print(f"                  {rpe_name}  ({p['rpe_nvols']} vols)")
@@ -526,10 +835,18 @@ def print_plan(plans: list):
             print(f"  Reverse PE:     {rpe_name}")
             print(f"  DWI volumes:    {p['dwi_nvols']}")
             print(f"  RPE volumes:    {p['rpe_nvols']}")
+
+        pe_str = p["pe_dir"]
+        if p["pe_source"] == "json_sidecar":
+            pe_str += (
+                "  (WARNING: inferred from JSON sidecar — not found in folder name)"
+            )
+        print(f"  PE direction:   {pe_str}")
         print(f"  Preproc mode:   {p['preproc_mode']}")
         print(f"  Readout time:   {p['readout_time']} ({p['readout_time_src']})")
         print(f"  Denoise/Gibbs:  {p['do_denoise']}")
         print(f"  Gradcheck:      {p['do_gradcheck']}")
+
         if p["do_gradcheck"]:
             targets = [f"DWI ({p['pe_dir']})"]
             if p["preproc_mode"] == "rpe_all":
@@ -539,11 +856,19 @@ def print_plan(plans: list):
             if p["rpe_nii"] and p["preproc_mode"] != "rpe_all":
                 targets.append("Reverse PE b0")
             print(f"    Gradcheck on: {', '.join(targets)}")
+
         if p["do_denoise"] and p["preproc_mode"] == "rpe_all":
             print(
                 f"    Denoise on:   DWI ({p['pe_dir']}) and DWI ({p['rpe_dir']}) separately"
             )
+
         print(f"  Output:         {p['out_dir']}")
+
+        for w in p["warnings"]:
+            print(f"  WARNING: {w}")
+        for n in p["notes"]:
+            print(f"  NOTE:    {n}")
+
     print("\n" + "=" * 70)
     print("Proceed? (Ctrl+C to abort)")
     print("=" * 70 + "\n")
@@ -577,10 +902,7 @@ def convert_dicoms(dicom_dir: str, out_dir: str):
 def convert_to_mif_initial(
     nii: str, json_file: str, bvec: str, bval: str, out_path: str
 ) -> str:
-    """
-    Step 1 of gradcheck flow: mrconvert NIfTI -> MIF using original gradients.
-    Gradients are embedded so dwigradcheck can operate on the MIF directly.
-    """
+    """Step 1 of gradcheck: mrconvert NIfTI -> MIF with original gradients embedded."""
     run_cmd(
         ["mrconvert", nii, out_path, "-json_import", json_file, "-fslgrad", bvec, bval]
     )
@@ -590,10 +912,7 @@ def convert_to_mif_initial(
 @pydra.mark.task
 @pydra.mark.annotate({"return": {"bvec": str, "bval": str}})
 def run_gradcheck(mif_path: str, out_dir: str, prefix: str):
-    """
-    Run dwigradcheck on a MIF (gradients already embedded).
-    Exports corrected bvec/bval.
-    """
+    """Run dwigradcheck on a MIF, export corrected bvec/bval."""
     out_bvec = str(Path(out_dir) / f"{prefix}_corrected.bvec")
     out_bval = str(Path(out_dir) / f"{prefix}_corrected.bval")
     run_cmd(["dwigradcheck", mif_path, "-export_grad_fsl", out_bvec, out_bval])
@@ -604,23 +923,15 @@ def run_gradcheck(mif_path: str, out_dir: str, prefix: str):
 def convert_to_mif_final(
     nii: str, json_file: str, bvec: str, bval: str, out_path: str
 ) -> str:
-    """
-    Step 2 of gradcheck flow: re-run mrconvert using corrected gradients.
-    Also used as the only mrconvert step when gradcheck is disabled.
-    """
+    """mrconvert NIfTI -> MIF with (optionally corrected) gradients."""
     run_cmd(
         ["mrconvert", nii, out_path, "-json_import", json_file, "-fslgrad", bvec, bval]
     )
-    # Verify PE table embedded
     result = subprocess.run(
         ["mrinfo", out_path, "-petable"], capture_output=True, text=True
     )
     if not result.stdout.strip():
         print(f"  Warning: PE table not found in MIF header: {out_path}")
-        print(
-            f"           Check {json_file} contains PhaseEncodingDirection "
-            f"and TotalReadoutTime"
-        )
     return out_path
 
 
@@ -638,7 +949,7 @@ def run_mrdegibbs(in_mif: str, out_mif: str) -> str:
 
 @pydra.mark.task
 def concatenate_ap_pa(ap_mif: str, pa_mif: str, out_mif: str) -> str:
-    """Concatenate AP and PA DWI series for rpe_all (AP first, PA last)."""
+    """Concatenate AP and PA DWI series (AP first) for rpe_all."""
     run_cmd(["dwicat", ap_mif, pa_mif, out_mif])
     return out_mif
 
@@ -659,10 +970,7 @@ def build_se_epi(
     preproc_mode: str,
     tmp_dir: str,
 ) -> str:
-    """
-    Build se_epi pair for rpe_pair / rpe_split.
-    Returns path to bzero_pair.mif.gz, or empty string if not needed.
-    """
+    """Build se_epi pair for rpe_pair / rpe_split. Returns bzero_pair path."""
     if preproc_mode not in ("rpe_pair", "rpe_split"):
         return ""
 
@@ -695,7 +1003,8 @@ def build_se_epi(
             ]
         )
     else:
-        print("  No forward PE image -- computing mean b0 from DWI...")
+        # #17 — use mean b0 from main DWI as forward PE
+        print("  No forward PE image — computing mean b0 from DWI...")
         mean_b0 = str(Path(tmp_dir) / f"mean_bzero_{pe_dir}.mif.gz")
         extract = subprocess.Popen(
             ["dwiextract", dwi_mif, "-", "-bzero"], stdout=subprocess.PIPE
@@ -724,11 +1033,6 @@ def run_dwifslpreproc(
     readout_time: float,
     eddy_options: str,
 ) -> str:
-    """
-    Run dwifslpreproc.
-    For rpe_all: dwi_mif must already be the AP+PA concatenated image.
-    For rpe_pair/rpe_split: se_epi is the bzero_pair image.
-    """
     cmd = [
         "dwifslpreproc",
         dwi_mif,
@@ -739,12 +1043,10 @@ def run_dwifslpreproc(
         "-eddy_options",
         eddy_options,
     ]
-
     if preproc_mode in ("rpe_pair", "rpe_split"):
-        cmd += ["-se_epi", se_epi, "-readout_time", str(readout_time)]
+        cmd += ["-se_epi", se_epi, "-readout_time", str(readout_time), "-align_seepi"]
     elif preproc_mode == "rpe_all":
         cmd += ["-readout_time", str(readout_time)]
-
     run_cmd(cmd)
     return out_mif
 
@@ -780,7 +1082,6 @@ def run_n4(t1_nii: str, out_nii: str) -> str:
 
 @pydra.mark.task
 def extract_mean_b0(dwi_biascorr_mif: str, out_nii: str) -> str:
-    """Extract mean b0 from bias-corrected DWI."""
     extract = subprocess.Popen(
         ["dwiextract", dwi_biascorr_mif, "-", "-bzero"], stdout=subprocess.PIPE
     )
@@ -795,7 +1096,6 @@ def extract_mean_b0(dwi_biascorr_mif: str, out_nii: str) -> str:
 @pydra.mark.task
 @pydra.mark.annotate({"return": {"b02t1_mat": str}})
 def register_b0_to_t1(b0_nii: str, t1_nii: str, out_b0_in_t1: str, out_mat: str):
-    """Register mean b0 to T1 using FLIRT (6 DOF)."""
     run_cmd(
         [
             "flirt",
@@ -817,11 +1117,9 @@ def register_b0_to_t1(b0_nii: str, t1_nii: str, out_b0_in_t1: str, out_mat: str)
 @pydra.mark.task
 @pydra.mark.annotate({"return": {"t1_in_dwi": str, "mrtrix_xfm": str}})
 def invert_and_apply_transform(b02t1_mat: str, t1_nii: str, b0_nii: str, tmp_dir: str):
-    """Invert b0->T1 transform and resample T1 into DWI space."""
     t12b0_mat = str(Path(tmp_dir) / "T12b0.mat")
     t1_in_dwi = str(Path(tmp_dir) / "T1_n4_in_DWI_space.nii.gz")
     mrtrix_txt = str(Path(tmp_dir) / "struct2diff_mrtrix.txt")
-
     run_cmd(["convert_xfm", "-omat", t12b0_mat, "-inverse", b02t1_mat])
     run_cmd(
         [
@@ -844,13 +1142,11 @@ def invert_and_apply_transform(b02t1_mat: str, t1_nii: str, b0_nii: str, tmp_dir
 @pydra.mark.task
 @pydra.mark.annotate({"return": {"adc": str, "fa": str}})
 def compute_tensor_metrics(dwi_biascorr_mif: str, tmp_dir: str):
-    """Run dwi2tensor and tensor2metric, output NIfTI ADC and FA."""
     tensor_mif = str(Path(tmp_dir) / "tensor.mif.gz")
     adc_mif = str(Path(tmp_dir) / "ADC.mif.gz")
     fa_mif = str(Path(tmp_dir) / "FA.mif.gz")
     adc_nii = str(Path(tmp_dir) / "ADC.nii.gz")
     fa_nii = str(Path(tmp_dir) / "FA.nii.gz")
-
     run_cmd(["dwi2tensor", dwi_biascorr_mif, tensor_mif])
     run_cmd(["tensor2metric", "-adc", adc_mif, "-fa", fa_mif, tensor_mif])
     run_cmd(["mrconvert", adc_mif, adc_nii])
@@ -870,13 +1166,11 @@ def copy_final_outputs(
     out_dir: str,
     dwi_preproc_name: str,
 ):
-    """Copy the four key outputs from tmp/ to the output directory."""
     os.makedirs(out_dir, exist_ok=True)
     dst_dwi = str(Path(out_dir) / dwi_preproc_name)
     dst_t1 = str(Path(out_dir) / "T1_n4_in_DWI_space.nii.gz")
     dst_adc = str(Path(out_dir) / "ADC.nii.gz")
     dst_fa = str(Path(out_dir) / "FA.nii.gz")
-
     for src, dst in [
         (dwi_biascorr_mif, dst_dwi),
         (t1_in_dwi, dst_t1),
@@ -895,10 +1189,9 @@ def copy_final_outputs(
 
 def build_dwi_workflow(plan: dict) -> pydra.Workflow:
     """
-    Build a Pydra workflow for a single DWI series based on a pre-computed plan.
-    Parallelism:
-      - T1 N4 bias correction runs in parallel with the DWI processing chain
-      - Both converge at registration
+    Build a Pydra workflow for a single DWI series from a pre-computed plan.
+    T1 N4 bias correction runs in parallel with the DWI chain, converging at
+    registration.
     """
     dwi_name = plan["dwi_name"]
     tmp_dir = plan["tmp_dir"]
@@ -912,18 +1205,25 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
     eddy_options = plan["eddy_options"]
     dwi_preproc_name = plan["dwi_preproc_name"]
 
-    fwd_pe_dir = plan["fwd_pe_dir"]
-    rpe_dir_path = plan["rpe_dir_path"]
-    dwi_conv_dir = plan["dwi_conv_dir"]
-    rpe_conv_dir = plan["rpe_conv_dir"]
-    fwd_conv_dir = plan["fwd_conv_dir"]
+    dwi_nii = plan["dwi_nii"]
+    dwi_json = plan["dwi_json"]
+    dwi_bvec = plan["dwi_bvec"]
+    dwi_bval = plan["dwi_bval"]
+    rpe_nii = plan["rpe_nii"]
+    rpe_json = plan["rpe_json"]
+    rpe_bvec = plan["rpe_bvec"]
+    rpe_bval = plan["rpe_bval"]
+    fwd_pe_nii = plan["fwd_pe_nii"]
+    fwd_pe_json = plan["fwd_pe_json"]
+    fwd_pe_bvec = plan["fwd_pe_bvec"]
+    fwd_pe_bval = plan["fwd_pe_bval"]
 
     safe_name = sanitise_name(dwi_name)
     wf = pydra.Workflow(name=f"dwi_{safe_name}", input_spec=["x"])
     wf.inputs.x = 1
 
     # ------------------------------------------------------------------
-    # T1 conversion + N4 (parallel branch)
+    # T1 branch (parallel)
     # ------------------------------------------------------------------
     t1_conv_dir = str(Path(tmp_dir) / "t1_nii")
     wf.add(
@@ -942,32 +1242,11 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
     )
 
     # ------------------------------------------------------------------
-    # DWI: use already-converted NIfTI from planning stage
-    # (dcm2niix already ran on DWI, RPE, FWD PE during plan_workflow)
-    # ------------------------------------------------------------------
-    dwi_nii = plan["dwi_nii"]
-    dwi_json = dwi_nii.replace(".nii.gz", ".json")
-    dwi_bvec = dwi_nii.replace(".nii.gz", ".bvec")
-    dwi_bval = dwi_nii.replace(".nii.gz", ".bval")
-
-    rpe_nii = plan["rpe_nii"]
-    rpe_json = rpe_nii.replace(".nii.gz", ".json") if rpe_nii else ""
-    rpe_bvec = rpe_nii.replace(".nii.gz", ".bvec") if rpe_nii else ""
-    rpe_bval = rpe_nii.replace(".nii.gz", ".bval") if rpe_nii else ""
-
-    fwd_pe_nii = plan["fwd_pe_nii"]
-    fwd_pe_json = fwd_pe_nii.replace(".nii.gz", ".json") if fwd_pe_nii else ""
-    fwd_pe_bvec = fwd_pe_nii.replace(".nii.gz", ".bvec") if fwd_pe_nii else ""
-    fwd_pe_bval = fwd_pe_nii.replace(".nii.gz", ".bval") if fwd_pe_nii else ""
-
-    # ------------------------------------------------------------------
-    # Gradcheck (change #8: operates on MIF, not NIfTI)
-    # For rpe_all: run gradcheck on both AP and PA independently
+    # DWI: mrconvert to MIF (with optional gradcheck)
     # ------------------------------------------------------------------
     dwi_raw_mif = str(Path(tmp_dir) / f"DWI_raw_{pe_dir}.mif.gz")
 
     if do_gradcheck:
-        # Step 1: initial mrconvert to embed gradients
         wf.add(
             convert_to_mif_initial(
                 name="dwi_to_mif_init",
@@ -978,7 +1257,6 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
                 out_path=str(Path(tmp_dir) / f"DWI_raw_{pe_dir}_init.mif.gz"),
             )
         )
-        # Step 2: gradcheck on MIF
         wf.add(
             run_gradcheck(
                 name="gradcheck_dwi",
@@ -987,7 +1265,6 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
                 prefix="dwi",
             )
         )
-        # Step 3: final mrconvert with corrected gradients
         wf.add(
             convert_to_mif_final(
                 name="dwi_to_mif",
@@ -999,7 +1276,6 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
             )
         )
 
-        # For rpe_all: gradcheck PA independently
         if preproc_mode == "rpe_all" and rpe_nii:
             rpe_raw_mif = str(Path(tmp_dir) / f"DWI_raw_{rpe_dir}.mif.gz")
             wf.add(
@@ -1032,7 +1308,6 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
             )
             rpe_mif_out = wf.rpe_to_mif.lzout.out
 
-        # Gradcheck for FWD PE (rpe_pair / rpe_split)
         elif fwd_pe_nii and preproc_mode in ("rpe_pair", "rpe_split"):
             wf.add(
                 convert_to_mif_initial(
@@ -1061,7 +1336,6 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
         dwi_mif_out = wf.dwi_to_mif.lzout.out
 
     else:
-        # No gradcheck: single mrconvert step
         wf.add(
             convert_to_mif_final(
                 name="dwi_to_mif",
@@ -1091,7 +1365,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
             rpe_mif_out = wf.rpe_to_mif.lzout.out
 
     # ------------------------------------------------------------------
-    # Denoise + Gibbs (change #6: for rpe_all, applied to AP and PA separately)
+    # Denoise + Gibbs (applied to AP and PA separately for rpe_all)
     # ------------------------------------------------------------------
     if do_denoise:
         wf.add(
@@ -1136,7 +1410,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
             rpe_for_preproc = rpe_mif_out
 
     # ------------------------------------------------------------------
-    # Concatenate AP + PA for rpe_all (change #5)
+    # Concatenate AP + PA for rpe_all
     # ------------------------------------------------------------------
     if preproc_mode == "rpe_all" and rpe_nii:
         wf.add(
@@ -1144,7 +1418,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
                 name="concat_ap_pa",
                 ap_mif=dwi_for_preproc,
                 pa_mif=rpe_for_preproc,
-                out_mif=str(Path(tmp_dir) / f"DWI_AP_PA_concat.mif.gz"),
+                out_mif=str(Path(tmp_dir) / "DWI_AP_PA_concat.mif.gz"),
             )
         )
         dwi_input_for_preproc = wf.concat_ap_pa.lzout.out
@@ -1152,8 +1426,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
         dwi_input_for_preproc = dwi_for_preproc
 
     # ------------------------------------------------------------------
-    # Build se_epi pair (rpe_pair / rpe_split only)
-    # b0-only images are ignored for rpe_all (change #3)
+    # se_epi pair (rpe_pair / rpe_split only)
     # ------------------------------------------------------------------
     wf.add(
         build_se_epi(
@@ -1211,7 +1484,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
     )
 
     # ------------------------------------------------------------------
-    # Extract mean b0 for registration
+    # Mean b0 extraction
     # ------------------------------------------------------------------
     wf.add(
         extract_mean_b0(
@@ -1222,7 +1495,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
     )
 
     # ------------------------------------------------------------------
-    # Registration (converges DWI and T1 branches)
+    # Registration (T1 and DWI branches converge here)
     # ------------------------------------------------------------------
     wf.add(
         register_b0_to_t1(
@@ -1289,46 +1562,74 @@ def run_pipeline(cfg: dict):
     print(f"Gradcheck:        {cfg.get('gradcheck', False)}")
     print(f"Output:           {Path(output_dir).resolve()}")
 
-    # Scan and classify directories
+    # Step 1: classify directories (provisional)
     dirs = scan_directory(scans_dir)
     print(f"\nFound:")
     print(f"  {len(dirs['t1_dirs'])} T1 series")
-    print(f"  {len(dirs['dwi_dirs'])} DWI series")
-    print(f"  {len(dirs['fwd_pe_dirs'])} forward PE images")
-    print(f"  {len(dirs['rpe_dirs'])} reverse PE images")
+    print(f"  {len(dirs['candidate_dwi'])} candidate DWI series (before filtering)")
     if dirs["ignored"]:
-        print(f"  {len(dirs['ignored'])} ignored (ADC/FA scanner maps)")
+        print(f"  {len(dirs['ignored'])} ignored (non-DWI)")
 
-    # Plan workflows (includes DICOM conversion for volume counting)
-    print("\nPlanning workflows (converting DICOMs for volume counting)...")
+    # Step 2: convert all candidate DICOMs
+    print("\nConverting DICOMs for all candidate series...")
+    conversions = convert_all_candidates(dirs["candidate_dwi"], output_dir)
+
+    # Steps 3-6: validate bvec/bval, check b-values, finalise classification
+    classified = classify_candidates(dirs["candidate_dwi"], conversions)
+
+    # Steps 7: detect AP/PA pairs (across dwi_dirs and pending series)
+    print("\nDetecting AP/PA pairs...")
+    # Pass existing fwd/rpe dirs into match so they are preserved
+    conversions["fwd_pe_dirs"] = classified["fwd_pe_dirs"]
+    conversions["rpe_dirs"] = classified["rpe_dirs"]
+    dwi_dirs, fwd_pe_dirs, rpe_dirs, rpe_all_map, tie_warnings = match_ap_pa_pairs(
+        classified["dwi_dirs"],
+        classified["pending_fwd"],
+        classified["pending_rpe"],
+        conversions,
+    )
+
+    print(f"\nAfter classification:")
+    print(f"  {len(dwi_dirs)} DWI series to process")
+    print(f"  {len(fwd_pe_dirs)} forward PE images")
+    print(f"  {len(rpe_dirs)} reverse PE images")
+    print(f"  {len(rpe_all_map)} rpe_all pairs detected")
+    if classified["skipped"]:
+        print(f"  {len(classified['skipped'])} series skipped")
+
+    if not dwi_dirs:
+        raise ValueError("No processable DWI series found after filtering.")
+
+    # Steps 8-11: plan each workflow
+    print("\nPlanning workflows...")
     plans = []
-    for dwi_dir in dirs["dwi_dirs"]:
+    for dwi_dir in dwi_dirs:
         plan = plan_workflow(
             dwi_dir=dwi_dir,
             t1_dirs=dirs["t1_dirs"],
-            fwd_pe_dirs=dirs["fwd_pe_dirs"],
-            rpe_dirs=dirs["rpe_dirs"],
-            rpe_all_map=dirs["rpe_all_map"],
+            fwd_pe_dirs=fwd_pe_dirs,
+            rpe_dirs=rpe_dirs,
+            rpe_all_map=rpe_all_map,
+            tie_warnings=tie_warnings,
+            conversions=conversions,
             cfg=cfg,
         )
         plans.append(plan)
 
-    # Print summary and pause for user confirmation
-    print_plan(plans)
+    # Step 12: print plan and pause
+    print_plan(plans, classified["skipped"])
 
-    # Build one sub-workflow per DWI series
+    # Build and run workflows
     sub_workflows = []
     for plan in plans:
         wf = build_dwi_workflow(plan)
         sub_workflows.append(wf)
 
-    # Top-level workflow — all DWI sub-workflows run in parallel
     top = pydra.Workflow(name="dwi_pipeline", input_spec=["x"])
     top.inputs.x = 1
     for wf in sub_workflows:
         top.add(wf)
 
-    # Use sanitised names for output attributes (fixes the SyntaxError)
     top.set_output(
         [
             (f"out_{sanitise_name(wf.name)}", getattr(top, wf.name).lzout.outputs)
@@ -1357,6 +1658,8 @@ def load_config(args) -> dict:
             cfg = yaml.safe_load(f) or {}
     if args.scans_dir:
         cfg["scans_dir"] = args.scans_dir
+    if args.output_dir:
+        cfg["output_dir"] = args.output_dir
     if args.denoise_degibbs:
         cfg["denoise_degibbs"] = True
     if args.gradcheck:
@@ -1365,8 +1668,6 @@ def load_config(args) -> dict:
         cfg["readout_time"] = args.readout_time
     if args.eddy_options is not None:
         cfg["eddy_options"] = args.eddy_options
-    if args.output_dir is not None:
-        cfg["output_dir"] = args.output_dir
     if "scans_dir" not in cfg:
         raise ValueError("scans_dir must be provided via --scans-dir or config YAML")
     return cfg
@@ -1379,21 +1680,10 @@ def main():
     parser.add_argument("--config", type=str, help="Path to YAML config file")
     parser.add_argument("--scans-dir", type=str, help="Path to scans directory")
     parser.add_argument("--output-dir", type=str, help="Path to output directory")
-    parser.add_argument(
-        "--denoise-degibbs",
-        action="store_true",
-        default=None,
-        help="Apply dwidenoise and mrdegibbs",
-    )
-    parser.add_argument(
-        "--gradcheck", action="store_true", default=None, help="Apply dwigradcheck"
-    )
-    parser.add_argument(
-        "--readout-time", type=float, default=None, help="Override total readout time"
-    )
-    parser.add_argument(
-        "--eddy-options", type=str, default=None, help="Options passed to eddy"
-    )
+    parser.add_argument("--denoise-degibbs", action="store_true", default=None)
+    parser.add_argument("--gradcheck", action="store_true", default=None)
+    parser.add_argument("--readout-time", type=float, default=None)
+    parser.add_argument("--eddy-options", type=str, default=None)
     args = parser.parse_args()
     cfg = load_config(args)
     run_pipeline(cfg)
