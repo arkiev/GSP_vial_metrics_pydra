@@ -338,25 +338,30 @@ def convert_all_candidates(candidate_dwi: list, output_dir: str) -> dict:
 def classify_candidates(candidate_dwi: list, conversions: dict) -> dict:
     """
     (#18) Final classification of candidate DWI series into:
-      - dwi_dirs:     full DWI series eligible for tensor processing
-      - fwd_pe_dirs:  forward PE correction images (b0-only or low-volume)
-      - rpe_dirs:     reverse PE correction images (b0-only or low-volume)
+      - dwi_dirs:     full DWI series eligible for tensor processing (non-zero bvals)
+      - fwd_pe_dirs:  forward PE correction images (all b-values zero)
+      - rpe_dirs:     reverse PE correction images (all b-values zero)
+      - pending_fwd:  series with non-zero bvals and a fwd PE direction tag anywhere
+                      in name — reclassified to dwi_dirs or fwd_pe_dirs after pairing
+      - pending_rpe:  same but reverse PE direction tag
       - skipped:      list of (path, reason) tuples
 
     Classification rules (applied in order after DICOM conversion):
       1. No bvec/bval files → skip (#16)
-      2. All b-values zero → candidate PE correction image, classify by PE tag
-      3. Has non-zero b-values AND terminal PE tag → provisional PE image;
-         will be reclassified to dwi_dirs if volume count matches a partner
-      4. Has non-zero b-values, no terminal PE tag → dwi_dirs
+      2. Empty bval file → skip (#16)
+      3. All b-values zero → PE correction image candidate, classified by PE
+         direction tag found ANYWHERE in folder name (direction tag position
+         does not affect classification — only bval content matters)
+      4. Has non-zero b-values AND a PE direction tag → pending (reclassified
+         after rpe_all pairing check)
+      5. Has non-zero b-values, no PE direction tag → dwi_dirs
     """
     dwi_dirs = []
     fwd_pe_dirs = []
     rpe_dirs = []
     skipped = []
-    # pending: series with terminal PE tag and non-zero bvals — reclassified after pairing
-    pending_fwd = []
-    pending_rpe = []
+    pending_fwd = []  # non-zero bvals + fwd PE tag — needs pairing check
+    pending_rpe = []  # non-zero bvals + rpe PE tag — needs pairing check
 
     for dicom_dir in candidate_dwi:
         name = Path(dicom_dir).name
@@ -380,17 +385,22 @@ def classify_candidates(candidate_dwi: list, conversions: dict) -> dict:
             continue
 
         is_b0_only = all_zero_bvals(bval)
-        terminal_fwd = has_terminal_pe(name, FWD_DIRS)
-        terminal_rpe = has_terminal_pe(name, RPE_DIRS)
+
+        # Detect PE direction tag anywhere in the folder name (not just terminal)
+        has_fwd_tag = any(
+            re.search(rf"_{re.escape(d)}(_|$)", name, re.IGNORECASE) for d in FWD_DIRS
+        )
+        has_rpe_tag = any(
+            re.search(rf"_{re.escape(d)}(_|$)", name, re.IGNORECASE) for d in RPE_DIRS
+        )
 
         if is_b0_only:
-            # All b-values zero: PE correction image candidate
-            if terminal_fwd:
+            # All b-values zero: classify as PE correction image by direction tag
+            if has_fwd_tag:
                 fwd_pe_dirs.append(dicom_dir)
-            elif terminal_rpe:
+            elif has_rpe_tag:
                 rpe_dirs.append(dicom_dir)
             else:
-                # No direction tag — note in plan but cannot use for correction
                 skipped.append(
                     (
                         dicom_dir,
@@ -399,10 +409,10 @@ def classify_candidates(candidate_dwi: list, conversions: dict) -> dict:
                     )
                 )
         else:
-            # Has non-zero b-values
-            if terminal_fwd:
+            # Has non-zero b-values: pending if PE tag present, dwi_dirs otherwise
+            if has_fwd_tag:
                 pending_fwd.append(dicom_dir)
-            elif terminal_rpe:
+            elif has_rpe_tag:
                 pending_rpe.append(dicom_dir)
             else:
                 dwi_dirs.append(dicom_dir)
@@ -411,7 +421,7 @@ def classify_candidates(candidate_dwi: list, conversions: dict) -> dict:
         "dwi_dirs": dwi_dirs,
         "fwd_pe_dirs": fwd_pe_dirs,
         "rpe_dirs": rpe_dirs,
-        "pending_fwd": pending_fwd,  # terminal PE tag + non-zero bvals, needs pairing
+        "pending_fwd": pending_fwd,
         "pending_rpe": pending_rpe,
         "skipped": skipped,
     }
@@ -525,38 +535,208 @@ def assign_t1(dwi_name: str, t1_dirs: list) -> str:
     return best if best is not None else t1_dirs[0]
 
 
-def find_best_pe_match(dwi_name: str, pe_dirs: list) -> tuple:
+def build_pe_assignment_map(
+    dwi_dirs: list, fwd_pe_dirs: list, rpe_dirs: list, rpe_all_map: dict
+) -> dict:
     """
-    (#19, #20) Match a PE directory to a DWI by longest common prefix.
-    When multiple PE dirs tie, break by nearest series number.
+    Build a map of {dwi_dir: {"rpe": rpe_dir_or_None, "fwd": fwd_dir_or_None}}
+    for all DWI series not already in rpe_all_map.
 
-    Returns (best_dir, tie_warning) where tie_warning is True if multiple
-    dirs shared the same best prefix length.
+    A single b0 PE correction image is assigned to ALL DWI series sharing the
+    longest common prefix with it — not just the nearest one. This correctly
+    handles the case where one b0 image is intended to correct an entire block
+    of acquisitions that vary only in a trailing parameter (e.g. bandwidth sweep).
+
+    If multiple PE images share the same best prefix length against a DWI block,
+    the one with the nearest series number to the block is chosen, with a warning.
+
+    Priority: rpe_all (already in rpe_all_map) > rpe_pair > rpe_none.
     """
-    dwi_stem = strip_series_number(dwi_name)
-    dwi_num = get_series_number(dwi_name)
-    best_len = 0
-    best_dirs = []
+    unpaired = [d for d in dwi_dirs if d not in rpe_all_map]
+    assignment = {d: {"rpe": None, "fwd": None, "tie_warning": False} for d in unpaired}
 
-    for d in pe_dirs:
-        pe_stem = strip_series_number(Path(d).name)
-        length = common_prefix_len(dwi_stem, pe_stem)
-        if length > best_len:
-            best_len = length
-            best_dirs = [d]
-        elif length == best_len and length > 0:
-            best_dirs.append(d)
+    def assign_pe_images(pe_dirs, key):
+        """
+        For each PE image, find all DWI series sharing the longest common prefix.
+        Assign this PE image to that entire group.
+        """
+        # Build prefix lengths: pe_dir -> {dwi_dir: prefix_len}
+        pe_scores = {}
+        for pe_dir in pe_dirs:
+            pe_stem = strip_series_number(Path(pe_dir).name)
+            scores = {}
+            for dwi_dir in unpaired:
+                dwi_stem = strip_series_number(Path(dwi_dir).name)
+                scores[dwi_dir] = common_prefix_len(dwi_stem, pe_stem)
+            pe_scores[pe_dir] = scores
 
-    if not best_dirs or best_len <= 10:
-        # Weak match — fall back to nearest series number
-        best_dirs = pe_dirs
-        tie = len(pe_dirs) > 1
+        # For each PE image, identify the group of DWI series with max prefix length
+        # Only assign if prefix length is meaningful (>10 chars)
+        pe_groups = {}  # pe_dir -> set of dwi_dirs it should serve
+        for pe_dir, scores in pe_scores.items():
+            max_len = max(scores.values()) if scores else 0
+            if max_len <= 10:
+                continue  # weak match, skip
+            group = {d for d, l in scores.items() if l == max_len}
+            pe_groups[pe_dir] = group
+
+        # For each DWI series, find which PE image has the best (longest) prefix
+        # If multiple PE images tie for a DWI series, pick nearest by series number
+        dwi_to_best_pe = {}
+        for dwi_dir in unpaired:
+            candidates = []
+            best_len = 0
+            for pe_dir, group in pe_groups.items():
+                if dwi_dir in group:
+                    pe_stem = strip_series_number(Path(pe_dir).name)
+                    dwi_stem = strip_series_number(Path(dwi_dir).name)
+                    length = common_prefix_len(dwi_stem, pe_stem)
+                    if length > best_len:
+                        best_len = length
+                        candidates = [pe_dir]
+                    elif length == best_len:
+                        candidates.append(pe_dir)
+            if not candidates:
+                continue
+            tie = len(candidates) > 1
+            dwi_num = get_series_number(Path(dwi_dir).name)
+            best_pe = min(
+                candidates, key=lambda p: abs(get_series_number(Path(p).name) - dwi_num)
+            )
+            dwi_to_best_pe[dwi_dir] = (best_pe, tie)
+
+        # Now assign: use the winning PE image for each DWI, extend to whole group
+        # Group DWI series that share the same winning PE image
+        pe_to_dwi_group = {}
+        for dwi_dir, (pe_dir, tie) in dwi_to_best_pe.items():
+            pe_to_dwi_group.setdefault(pe_dir, []).append((dwi_dir, tie))
+
+        for pe_dir, dwi_list in pe_to_dwi_group.items():
+            any_tie = any(tie for _, tie in dwi_list)
+            for dwi_dir, _ in dwi_list:
+                if assignment[dwi_dir][key] is None:
+                    assignment[dwi_dir][key] = pe_dir
+                    assignment[dwi_dir]["tie_warning"] = any_tie
+
+    assign_pe_images(rpe_dirs, "rpe")
+    assign_pe_images(fwd_pe_dirs, "fwd")
+
+    return assignment
+
+
+# =============================================================================
+# PE table header-based mode inference
+# =============================================================================
+
+# Mapping from (i, j, k) unit vector (rounded) to direction string.
+# MRtrix convention: j- = AP, j = PA, i = LR, i- = RL, k = SI, k- = IS
+_PETABLE_VEC_TO_DIR = {
+    (0, 1, 0): "PA",
+    (0, -1, 0): "AP",
+    (1, 0, 0): "LR",
+    (-1, 0, 0): "RL",
+    (0, 0, 1): "SI",
+    (0, 0, -1): "IS",
+}
+
+
+def _petable_vec_to_dir(vec: tuple) -> str:
+    """
+    Map a (i, j, k) unit vector from mrinfo -petable to a direction string.
+    Returns 'UNKNOWN' if the vector doesn't match any known direction.
+    """
+    rounded = tuple(round(float(v)) for v in vec)
+    return _PETABLE_VEC_TO_DIR.get(rounded, f"UNKNOWN{rounded}")
+
+
+def get_petable_mode(
+    nii: str, bvec: str, bval: str, json_path: str, tmp_dir: str, has_rpe: bool
+) -> tuple:
+    """
+    Infer the preproc mode for a DWI series by reading the phase encoding table
+    embedded in the MIF header produced by mrconvert.
+
+    Steps:
+      1. mrconvert NIfTI+bvec+bval+JSON → temporary MIF
+      2. mrinfo -petable on the MIF
+      3. Parse rows to extract PE directions per volume
+      4. Apply mode inference rules:
+           - All same direction, no RPE available  → rpe_none
+           - All same direction, RPE available     → rpe_pair
+           - Mixed directions, equal counts        → rpe_all
+           - Mixed directions, unequal counts      → rpe_split
+
+    Returns:
+      (mode, directions_found, petable_rows)
+      mode:             one of 'rpe_none', 'rpe_pair', 'rpe_all', 'rpe_split'
+      directions_found: list of direction strings per volume (e.g. ['AP','AP','PA'])
+      petable_rows:     raw petable as list of lists (for diagnostics)
+
+    Raises RuntimeError if mrconvert or mrinfo fails.
+    """
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_mif = str(Path(tmp_dir) / "petable_check.mif")
+
+    # Build mrconvert command — include JSON sidecar if available (embeds PE info)
+    cmd = ["mrconvert", nii, tmp_mif, "-fslgrad", bvec, bval, "-force", "-quiet"]
+    if json_path and Path(json_path).exists():
+        cmd += ["-json_import", json_path]
+
+    try:
+        subprocess.run(
+            [str(c) for c in cmd], check=True, capture_output=True, text=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"mrconvert failed during petable check: {e.stderr.strip()}")
+
+    # Read petable — columns: i  j  k  readout_time  (one row per volume)
+    try:
+        result = subprocess.run(
+            ["mrinfo", tmp_mif, "-petable"], capture_output=True, text=True, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"mrinfo -petable failed: {e.stderr.strip()}")
+    finally:
+        # Always clean up the temporary MIF
+        try:
+            Path(tmp_mif).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    raw = result.stdout.strip()
+    if not raw:
+        raise RuntimeError(
+            "mrinfo -petable returned no output — PE information "
+            "may not be embedded in this image."
+        )
+
+    petable_rows = []
+    directions = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        vec = (parts[0], parts[1], parts[2])
+        petable_rows.append(parts)
+        directions.append(_petable_vec_to_dir(vec))
+
+    if not directions:
+        raise RuntimeError("Could not parse any rows from mrinfo -petable output.")
+
+    unique_dirs = set(directions)
+
+    if len(unique_dirs) == 1:
+        # All volumes have the same PE direction
+        mode = "rpe_pair" if has_rpe else "rpe_none"
     else:
-        tie = len(best_dirs) > 1
+        # Mixed PE directions in a single series
+        counts = {d: directions.count(d) for d in unique_dirs}
+        if len(set(counts.values())) == 1:
+            mode = "rpe_all"  # equal counts
+        else:
+            mode = "rpe_split"  # unequal counts
 
-    # Break tie by nearest series number
-    best = min(best_dirs, key=lambda d: abs(get_series_number(Path(d).name) - dwi_num))
-    return best, tie
+    return mode, directions, petable_rows
 
 
 # =============================================================================
@@ -596,13 +776,15 @@ def plan_workflow(
     fwd_pe_dirs: list,
     rpe_dirs: list,
     rpe_all_map: dict,
-    tie_warnings: list,
+    pe_assignment_map: dict,
     conversions: dict,
     cfg: dict,
 ) -> dict:
     """
     Build a complete plan dict for a single DWI series.
     All DICOM conversion has already been done — we use results from conversions.
+    PE correction image assignments come from pe_assignment_map (pre-built so that
+    one b0 image can be shared across a whole block of DWI series).
     """
     dwi_name = Path(dwi_dir).name
     conv = conversions[dwi_dir]
@@ -632,7 +814,7 @@ def plan_workflow(
             f"— not found in folder name. Please verify."
         )
 
-    # RPE assignment
+    # RPE assignment — priority: rpe_all > rpe_pair > rpe_none
     rpe_all_partner = rpe_all_map.get(dwi_dir)
 
     rpe_nii = None
@@ -642,84 +824,66 @@ def plan_workflow(
     rpe_dir_path = None
 
     if rpe_all_partner:
-        # rpe_all: full-volume PA partner
+        # rpe_all: full-volume PA partner — most preferred
         rpe_dir_path = rpe_all_partner
         rpe_conv = conversions.get(rpe_all_partner)
         if rpe_conv:
             rpe_nii = rpe_conv["nii"]
             rpe_nvols = get_nvols(rpe_nii)
 
-        # Check for rpe_all vs rpe_split warning
-        rpe_all_warning = None
         if rpe_nvols == dwi_nvols:
-            rpe_all_warning = (
+            warnings.append(
                 f"{dwi_name} and {Path(rpe_all_partner).name} have equal volumes "
                 f"({dwi_nvols}). Assuming rpe_all (full repeats). If directions are "
                 f"split across PE directions, set mode: rpe_split in config YAML."
             )
-            warnings.append(rpe_all_warning)
-
-        fwd_pe_dir_used = None  # b0 PE images not needed
+        fwd_pe_dir_used = None  # b0 PE images not needed for rpe_all
 
     else:
-        # Use b0 PE correction images
-        rpe_match = None
-        rpe_tie = False
-        if rpe_dirs:
-            rpe_match, rpe_tie = find_best_pe_match(dwi_name, rpe_dirs)
+        # Use pe_assignment_map for b0 PE correction (rpe_pair)
+        assignment = pe_assignment_map.get(dwi_dir, {})
+        rpe_dir_path = assignment.get("rpe")
+        fwd_pe_dir_used = assignment.get("fwd")
+        tie_warning = assignment.get("tie_warning", False)
 
-        fwd_match = None
-        fwd_tie = False
-        if fwd_pe_dirs:
-            fwd_match, fwd_tie = find_best_pe_match(dwi_name, fwd_pe_dirs)
-
-        rpe_dir_path = rpe_match
-        fwd_pe_dir_used = fwd_match
-
-        # #20 — tie warnings
-        if rpe_tie and rpe_match:
+        # #20 — tie warning
+        if tie_warning:
             warnings.append(
-                f"{Path(rpe_match).name} matched equally to multiple DWI series. "
+                f"PE correction image matched equally to multiple DWI series. "
                 f"Assigned by nearest series number. If incorrect, consider adding "
                 f"a distinguishing suffix (e.g. _repeat) to the second acquisition "
                 f"block and its correction pair."
             )
-        if fwd_tie and fwd_match:
-            warnings.append(
-                f"{Path(fwd_match).name} matched equally to multiple DWI series. "
-                f"Assigned by nearest series number."
-            )
 
-        # Convert RPE if available
+        # Ensure RPE conversion is available
         if rpe_dir_path:
-            rpe_conv_dir = str(Path(tmp_dir) / "rpe_nii")
             rpe_conv = conversions.get(rpe_dir_path)
             if rpe_conv is None:
-                # Convert now if not already done
+                rpe_conv_dir = str(Path(tmp_dir) / "rpe_nii")
                 rpe_conv = convert_dicom_to_nii(rpe_dir_path, rpe_conv_dir)
                 conversions[rpe_dir_path] = rpe_conv
             rpe_nii = rpe_conv["nii"]
             rpe_nvols = get_nvols(rpe_nii)
 
-        # Convert FWD PE if available
+        # Ensure FWD PE conversion is available
         if fwd_pe_dir_used:
-            fwd_conv_dir = str(Path(tmp_dir) / "fwd_pe_nii")
             fwd_conv = conversions.get(fwd_pe_dir_used)
             if fwd_conv is None:
+                fwd_conv_dir = str(Path(tmp_dir) / "fwd_pe_nii")
                 fwd_conv = convert_dicom_to_nii(fwd_pe_dir_used, fwd_conv_dir)
                 conversions[fwd_pe_dir_used] = fwd_conv
             fwd_pe_nii = fwd_conv["nii"]
 
-        # #17 — orphaned RPE handling
+        # #17 — orphaned RPE handling (no forward PE partner)
         if rpe_dir_path and not fwd_pe_dir_used:
             if rpe_nvols == 1:
                 warnings.append(
-                    f"{Path(rpe_dir_path).name} has no matching forward PE partner. "
+                    f"{Path(rpe_dir_path).name} has no matching forward PE image. "
                     f"Will use mean b0 from main DWI as forward PE image (rpe_pair)."
                 )
             elif rpe_nvols > 1:
                 warnings.append(
-                    f"{Path(rpe_dir_path).name} has no matching forward PE partner "
+                    f"{Path(rpe_dir_path).name} has no matching forward PE image "
                     f"and RPE has multiple volumes. Cannot use for correction. "
                     f"Falling back to rpe_none."
                 )
@@ -737,10 +901,78 @@ def plan_workflow(
     else:
         preproc_mode = "rpe_pair"
 
-    # #21 — note unused PE images
-    notes = []
+    # ── Header-based mode sanity check ──────────────────────────────────────
+    # Run mrconvert + mrinfo -petable on the main DWI (and RPE if present) to
+    # derive the mode independently from the MIF header PE table.  If the result
+    # disagrees with the filename-derived mode, warn and override.
+    #
+    # For rpe_all: the check requires a concatenated AP+PA MIF which does not
+    # exist at planning time.  We skip the header check for rpe_all and note it.
+    petable_tmp = str(Path(tmp_dir) / "petable_check")
+    if preproc_mode == "rpe_all":
+        notes_petable = (
+            "Header PE check: skipped for rpe_all "
+            "(requires concatenated AP+PA MIF — verified during processing)"
+        )
+    else:
+        try:
+            header_mode, header_dirs, _ = get_petable_mode(
+                nii=dwi_nii,
+                bvec=dwi_bvec,
+                bval=dwi_bval,
+                json_path=dwi_json,
+                tmp_dir=petable_tmp,
+                has_rpe=rpe_nii is not None,
+            )
+
+            # Also check RPE series if present
+            rpe_header_mode = None
+            if rpe_nii:
+                rpe_conv_for_check = conversions.get(rpe_dir_path, {})
+                try:
+                    rpe_header_mode, _, _ = get_petable_mode(
+                        nii=rpe_nii,
+                        bvec=rpe_conv_for_check.get("bvec", ""),
+                        bval=rpe_conv_for_check.get("bval", ""),
+                        json_path=rpe_conv_for_check.get("json", ""),
+                        tmp_dir=petable_tmp + "_rpe",
+                        has_rpe=False,  # checking the RPE series itself in isolation
+                    )
+                except RuntimeError as e:
+                    warnings.append(
+                        f"Header check on RPE series could not be completed: {e} "
+                        f"— RPE series assignment retained."
+                    )
+
+            if header_mode != preproc_mode:
+                warnings.append(
+                    f"Preproc mode mismatch — filename-derived: {preproc_mode}, "
+                    f"header-derived: {header_mode}. "
+                    f"Overriding with header-derived mode. "
+                    f"PE directions found in header: {sorted(set(header_dirs))}. "
+                    f"Please verify series naming and acquisition protocol."
+                )
+                preproc_mode = header_mode
+
+            notes_petable = (
+                f"Header PE check: {header_mode} "
+                f"(directions: {', '.join(sorted(set(header_dirs)))})"
+            )
+            if rpe_header_mode:
+                notes_petable += f"; RPE header: {rpe_header_mode}"
+
+        except RuntimeError as e:
+            warnings.append(
+                f"Header-based PE mode check could not be completed: {e} "
+                f"— falling back to filename-derived mode ({preproc_mode})."
+            )
+            notes_petable = "Header PE check: unavailable"
+
+    # #21 — note unused PE images when rpe_all is used
+    notes = [notes_petable]
     if rpe_all_partner:
-        for d in fwd_pe_dirs + rpe_dirs:
+        unused = [d for d in fwd_pe_dirs + rpe_dirs if d != rpe_all_partner]
+        for d in unused:
             notes.append(f"{Path(d).name} — not used (DWI series has rpe_all partner)")
 
     # Resolve readout time
@@ -765,7 +997,6 @@ def plan_workflow(
         else "DWI_preproc_biascorr.mif.gz"
     )
 
-    # Build paths for sidecar files
     rpe_conv = conversions.get(rpe_dir_path) if rpe_dir_path else None
     fwd_conv = conversions.get(fwd_pe_dir_used) if fwd_pe_dir_used else None
 
@@ -1589,6 +1820,12 @@ def run_pipeline(cfg: dict):
         conversions,
     )
 
+    # Step 8: build PE assignment map — one b0 PE image → all DWI series in same block
+    print("Assigning PE correction images to DWI blocks...")
+    pe_assignment_map = build_pe_assignment_map(
+        dwi_dirs, fwd_pe_dirs, rpe_dirs, rpe_all_map
+    )
+
     print(f"\nAfter classification:")
     print(f"  {len(dwi_dirs)} DWI series to process")
     print(f"  {len(fwd_pe_dirs)} forward PE images")
@@ -1600,7 +1837,7 @@ def run_pipeline(cfg: dict):
     if not dwi_dirs:
         raise ValueError("No processable DWI series found after filtering.")
 
-    # Steps 8-11: plan each workflow
+    # Steps 9-12: plan each workflow
     print("\nPlanning workflows...")
     plans = []
     for dwi_dir in dwi_dirs:
@@ -1610,13 +1847,13 @@ def run_pipeline(cfg: dict):
             fwd_pe_dirs=fwd_pe_dirs,
             rpe_dirs=rpe_dirs,
             rpe_all_map=rpe_all_map,
-            tie_warnings=tie_warnings,
+            pe_assignment_map=pe_assignment_map,
             conversions=conversions,
             cfg=cfg,
         )
         plans.append(plan)
 
-    # Step 12: print plan and pause
+    # Step 13: print plan and pause
     print_plan(plans, classified["skipped"])
 
     # Build and run workflows
