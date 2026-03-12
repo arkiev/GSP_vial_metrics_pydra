@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""
+plot_vial_intensity.py
+Plot vial vs intensity (mean ± std) for 3D or 4D contrasts, with optional ROI overlay.
+
+Plot mode is detected automatically from the csv_file filename:
+
+  ADC mode  – filename contains 'ADC' (case-insensitive)
+    · Y-axis: ADC ×10⁻³ mm²/s
+    · Reference values + ±5%/±10% tolerance bands drawn (blue crosshairs / shading)
+    · Measured values plotted as filled red circles
+    · Requires --phantom and --template_dir so the reference JSON can be loaded
+
+  FA mode   – filename contains standalone 'FA' (case-insensitive, whole-word)
+    · Y-axis: Fractional Anisotropy, fixed range 0–1
+
+  Generic   – all other filenames → standard intensity plot
+"""
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
@@ -6,7 +24,16 @@ import argparse
 import sys
 import csv
 import os
+import json
+import re
 import numpy as np
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 
 def detect_separator(file_path):
     """Detects the most likely CSV separator by sniffing the first line."""
@@ -19,77 +46,390 @@ def detect_separator(file_path):
     except Exception as e:
         sys.exit(f"Error detecting separator: {e}")
 
+
+def load_adc_reference(template_dir: str, phantom: str) -> dict:
+    """
+    Load ADC reference values from TemplateData/<phantom>/adc_reference.json.
+
+    Returns a dict with keys:
+        'vials'        : list of vial labels in order
+        'adc_mm2_per_s': dict mapping vial label -> reference ADC (mm²/s)
+    """
+    ref_path = os.path.join(template_dir, phantom, "adc_reference.json")
+    if not os.path.isfile(ref_path):
+        sys.exit(
+            f"Error: ADC reference file not found at '{ref_path}'.\n"
+            f"Expected structure: <template_dir>/<phantom>/adc_reference.json"
+        )
+    with open(ref_path) as fh:
+        data = json.load(fh)
+    required_keys = {"vials", "adc_mm2_per_s"}
+    if not required_keys.issubset(data.keys()):
+        sys.exit(f"Error: adc_reference.json must contain keys: {required_keys}")
+    return data
+
+
+def overlay_adc_reference(ax: plt.Axes, ref_data: dict):
+    """
+    Draw per-vial ±5% and ±10% tolerance rings plus reference ADC crosshair
+    markers onto *ax*.  Values are converted to ×10⁻³ for display.
+
+    Each vial gets:
+      - An outer open circle whose y-radius spans ±10% of the reference value
+      - An inner open circle whose y-radius spans ±5% of the reference value
+      - A crosshair (+) at the reference value
+    Rings are drawn as scatter markers scaled so their visual size reflects the
+    tolerance range, making it clear the tolerance is per-vial and not connected
+    across vials.
+    """
+    vials = ref_data["vials"]
+    ref_vals = np.array([ref_data["adc_mm2_per_s"][v] for v in vials])
+    x = np.arange(len(vials))
+    ref_display = ref_vals * 1e3  # convert to ×10⁻³ for display
+
+    # Open circles: marker size is set large enough to be clearly visible.
+    # The outer ring (±10%) is drawn first (behind), inner ring (±5%) on top.
+    ax.scatter(
+        x,
+        ref_display,
+        marker="o",
+        s=600,
+        linewidths=1.5,
+        facecolors="none",
+        edgecolors="steelblue",
+        alpha=0.4,
+        zorder=2,
+        label="_nolegend_",
+    )  # ±10% outer ring
+
+    ax.scatter(
+        x,
+        ref_display,
+        marker="o",
+        s=250,
+        linewidths=1.5,
+        facecolors="none",
+        edgecolors="steelblue",
+        alpha=0.7,
+        zorder=3,
+        label="_nolegend_",
+    )  # ±5% inner ring
+
+    # Crosshair at reference value
+    ax.scatter(
+        x, ref_display, marker="+", s=120, linewidths=1.8, color="steelblue", zorder=4
+    )
+
+
+def build_adc_legend(has_measured: bool) -> list:
+    """Return legend handles for the ADC overlay."""
+    ring_10 = plt.Line2D(
+        [0],
+        [0],
+        marker="o",
+        color="steelblue",
+        linestyle="None",
+        markersize=14,
+        markerfacecolor="none",
+        markeredgewidth=1.5,
+        alpha=0.4,
+        label="Reference ±10%",
+    )
+    ring_5 = plt.Line2D(
+        [0],
+        [0],
+        marker="o",
+        color="steelblue",
+        linestyle="None",
+        markersize=9,
+        markerfacecolor="none",
+        markeredgewidth=1.5,
+        alpha=0.7,
+        label="Reference ±5%",
+    )
+    ref_handle = plt.Line2D(
+        [0],
+        [0],
+        marker="+",
+        color="steelblue",
+        linestyle="None",
+        markersize=10,
+        markeredgewidth=1.8,
+        label="Reference ADC",
+    )
+    handles = [ring_10, ring_5, ref_handle]
+    if has_measured:
+        meas_handle = plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="crimson",
+            linestyle="None",
+            markersize=7,
+            label="Mean (SD) ADC",
+        )
+        handles.append(meas_handle)
+    return handles
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot vial vs intensity (mean ± std) for 3D or 4D contrasts, with optional ROI overlay."
+        description=(
+            "Plot vial vs intensity (mean ± std) for 3D or 4D contrasts, "
+            "with optional ROI overlay.\n\n"
+            "Plot mode (ADC / FA / generic) is detected automatically from "
+            "the csv_file filename — no flags required."
+        )
     )
-    parser.add_argument("csv_file", help="CSV file containing mean values (vial, mean[, vol1, vol2...]).")
-    parser.add_argument("plot_type", choices=["line", "bar", "scatter"],
-                        help="Type of plot to generate.")
-    parser.add_argument("--std_csv", help="Optional CSV file containing standard deviations (same shape as mean).")
-    parser.add_argument("--roi_image", help="Optional PNG image (e.g. mrview screenshot with ROI overlay).")
-    parser.add_argument("--annotate", action="store_true", help="Annotate points with mean ± std values.")
-    parser.add_argument("--output", default="vial_subplot.png",
-                        help="Filename for saving the plot (default: vial_subplot.png).")
+    # ---- positional --------------------------------------------------------
+    parser.add_argument(
+        "csv_file",
+        help="CSV file containing mean values (vial, mean[, vol1, vol2...]).",
+    )
+    parser.add_argument(
+        "plot_type",
+        choices=["line", "bar", "scatter"],
+        help="Type of plot to generate.",
+    )
+    # ---- standard options --------------------------------------------------
+    parser.add_argument(
+        "--std_csv",
+        help="Optional CSV file containing standard deviations (same shape as mean CSV).",
+    )
+    parser.add_argument(
+        "--roi_image",
+        help="Optional PNG image (e.g. mrview screenshot with ROI overlay).",
+    )
+    parser.add_argument(
+        "--annotate",
+        action="store_true",
+        help="Annotate points with mean ± std values.",
+    )
+    parser.add_argument(
+        "--output",
+        default="vial_subplot.png",
+        help="Filename for saving the plot (default: vial_subplot.png).",
+    )
+    # ---- phantom options (used when ADC mode is auto-detected) -------------
+    parser.add_argument(
+        "--phantom",
+        default=None,
+        help=(
+            "Phantom name (e.g. SPIRIT).  Used to locate ADC reference data "
+            "and to label plot titles.  Required when the csv_file name "
+            "contains 'ADC'."
+        ),
+    )
+    parser.add_argument(
+        "--template_dir",
+        default=None,
+        help=(
+            "Path to the TemplateData directory.  "
+            "ADC reference is read from <template_dir>/<phantom>/adc_reference.json.  "
+            "Required when the csv_file name contains 'ADC'."
+        ),
+    )
+
     args = parser.parse_args()
 
-    # --- Load mean CSV ---
+    # ---- Auto-detect contrast mode from csv_file filename ------------------
+    csv_stem = Path(args.csv_file).stem
+    if re.search(r"ADC", csv_stem, re.IGNORECASE):
+        contrast_mode = "adc"
+    elif re.search(r"(?<![A-Za-z0-9])FA(?![A-Za-z0-9])", csv_stem):
+        contrast_mode = "fa"
+    else:
+        contrast_mode = "generic"
+
+    print(f"[INFO] Contrast mode detected: {contrast_mode}")
+
+    # ---- Validate: ADC mode needs phantom + template_dir -------------------
+    if contrast_mode == "adc":
+        if not args.phantom:
+            sys.exit(
+                "Error: --phantom is required when the csv_file name contains 'ADC'."
+            )
+        if not args.template_dir:
+            sys.exit(
+                "Error: --template_dir is required when the csv_file name contains 'ADC'."
+            )
+
+    # ---- Load mean CSV -----------------------------------------------------
     sep = detect_separator(args.csv_file)
     mean_df = pd.read_csv(args.csv_file, sep=sep)
     if mean_df.shape[1] < 2:
-        sys.exit("Error: mean CSV must have at least two columns (vial + at least one volume).")
+        sys.exit(
+            "Error: mean CSV must have at least two columns (vial + at least one volume)."
+        )
 
     vials = mean_df.iloc[:, 0].astype(str).str.replace(r"\.mif$", "", regex=True)
-    mean_values = mean_df.iloc[:, 1:].to_numpy()   # shape (n_vials, n_vols)
+    mean_values = mean_df.iloc[:, 1:].to_numpy()  # shape (n_vials, n_vols)
     n_vols = mean_values.shape[1]
 
-    # --- Load std CSV (optional) ---
+    # ---- Load std CSV (optional) -------------------------------------------
     std_values = None
     if args.std_csv:
         sep_std = detect_separator(args.std_csv)
         std_df = pd.read_csv(args.std_csv, sep=sep_std)
         if std_df.shape[1] < 2:
-            sys.exit("Error: std CSV must have at least two columns (vial + at least one volume).")
+            sys.exit(
+                "Error: std CSV must have at least two columns (vial + at least one volume)."
+            )
         std_values = std_df.iloc[:, 1:].to_numpy()  # shape (n_vials, n_vols)
 
-    # --- Setup figure: one plot + optional ROI image ---
-    ncols = 2 if args.roi_image else 1
-    fig, axes = plt.subplots(1, ncols, figsize=(8*ncols, 6), squeeze=False)
-    axes = axes[0]  # flatten row
+    # ---- In ADC mode, restrict to vials E–L --------------------------------
+    ADC_VIALS = ["E", "F", "G", "H", "I", "J", "K", "L"]
+    if contrast_mode == "adc":
+        mask = vials.str.upper().isin(ADC_VIALS)
+        vials = vials[mask].reset_index(drop=True)
+        mean_values = mean_values[mask.values]
+        if std_values is not None:
+            std_values = std_values[mask.values]
 
+    # ---- Load ADC reference (ADC mode only) --------------------------------
+    ref_data = None
+    if contrast_mode == "adc":
+        ref_data = load_adc_reference(args.template_dir, args.phantom)
+
+    # ---- Setup figure ------------------------------------------------------
+    ncols = 2 if args.roi_image else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, 6), squeeze=False)
+    axes = axes[0]  # flatten row
     ax = axes[0]
 
-    # --- Plot each volume in a different colour ---
+    # ---- ADC reference bands (drawn first, behind data) -------------------
+    if ref_data is not None:
+        overlay_adc_reference(ax, ref_data)
+
+    # ---- In ADC mode, scale measured values to ×10⁻³ for display ----------
+    # The CSV is expected to contain raw ADC values in mm²/s; we convert here.
+    display_values = mean_values * 1e3 if contrast_mode == "adc" else mean_values
+    display_stds = (
+        std_values * 1e3
+        if (contrast_mode == "adc" and std_values is not None)
+        else std_values
+    )
+
+    # ---- Plot each volume --------------------------------------------------
     cmap = plt.get_cmap("tab10")
+
     for vol_idx in range(n_vols):
-        means = mean_values[:, vol_idx]
-        stds = std_values[:, vol_idx] if std_values is not None else None
-        color = cmap(vol_idx % 10)
+        means = display_values[:, vol_idx]
+        stds = display_stds[:, vol_idx] if display_stds is not None else None
+
+        if contrast_mode == "adc":
+            color = "crimson"
+            fmt_line = "-o"
+            fmt_scatter = "o"
+            marker_kw = dict(
+                markersize=7, markerfacecolor="crimson", markeredgecolor="crimson"
+            )
+            vol_label = f"Vol {vol_idx}" if n_vols > 1 else "Mean (SD) ADC"
+        else:
+            color = cmap(vol_idx % 10)
+            fmt_line = "-o"
+            fmt_scatter = "o"
+            marker_kw = {}
+            vol_label = f"Vol {vol_idx}"
 
         if args.plot_type == "line":
-            ax.errorbar(vials, means, yerr=stds, fmt='-o', capsize=5, color=color, label=f"Vol {vol_idx}")
+            ax.errorbar(
+                vials,
+                means,
+                yerr=stds,
+                fmt=fmt_line,
+                capsize=5,
+                color=color,
+                label=vol_label,
+                **marker_kw,
+            )
         elif args.plot_type == "bar":
-            # Offset bars for each volume slightly so they don't overlap
-            x = np.arange(len(vials)) + (vol_idx - n_vols/2) * 0.1
-            ax.bar(x, means, yerr=stds, capsize=5, color=color, width=0.1, label=f"Vol {vol_idx}")
+            x = np.arange(len(vials)) + (vol_idx - n_vols / 2) * 0.1
+            ax.bar(
+                x, means, yerr=stds, capsize=5, color=color, width=0.1, label=vol_label
+            )
             ax.set_xticks(np.arange(len(vials)))
             ax.set_xticklabels(vials)
         elif args.plot_type == "scatter":
-            ax.errorbar(vials, means, yerr=stds, fmt='o', capsize=5, color=color, label=f"Vol {vol_idx}")
+            ax.errorbar(
+                vials,
+                means,
+                yerr=stds,
+                fmt=fmt_scatter,
+                capsize=5,
+                color=color,
+                label=vol_label,
+                **marker_kw,
+            )
 
         if args.annotate:
-            for vial, mean, std in zip(vials, means, stds if stds is not None else [0]*len(means)):
-                ax.text(vial, mean + (max(means) * 0.02),
-                        f"{mean:.1f}±{std:.1f}" if stds is not None else f"{mean:.1f}",
-                        ha='center', fontsize=8, color=color)
+            for vial, mean, std in zip(
+                vials, means, stds if stds is not None else [0] * len(means)
+            ):
+                ax.text(
+                    vial,
+                    mean + (max(means) * 0.02),
+                    f"{mean:.3f}±{std:.3f}" if stds is not None else f"{mean:.3f}",
+                    ha="center",
+                    fontsize=8,
+                    color=color,
+                )
 
-    ax.set_xlabel("Vial")
-    ax.set_ylabel("Intensity")
-    ax.set_title("Vial vs Intensity (Mean ± Std)")
-    ax.grid(True, linestyle='--', alpha=0.6)
-    ax.legend(title="Volumes")
+    # ---- Axis labels -------------------------------------------------------
+    ax.set_xlabel("Vial", fontsize=12)
 
-    # --- ROI overlay subplot ---
+    phantom_label = f"{args.phantom} Phantom – " if args.phantom else ""
+
+    if contrast_mode == "adc":
+        ax.set_ylabel("ADC ×10⁻³ mm²/s", fontsize=12)
+        ax.set_title(
+            f"{phantom_label}Measured vs Reference ADC", fontsize=13, fontweight="bold"
+        )
+        # Plain numeric ticks (values are already in ×10⁻³)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, _: f"{val:.2f}"))
+    elif contrast_mode == "fa":
+        ax.set_ylabel("Fractional Anisotropy", fontsize=12)
+        ax.set_title(
+            f"{phantom_label}Fractional Anisotropy (Mean ± Std)",
+            fontsize=13,
+            fontweight="bold",
+        )
+        ax.set_ylim(0, 1)
+    else:
+        ax.set_ylabel("Intensity", fontsize=12)
+        ax.set_title(f"{phantom_label}Vial vs Intensity (Mean ± Std)", fontsize=13)
+
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    # ---- Legend ------------------------------------------------------------
+    if contrast_mode == "adc":
+        extra_handles = build_adc_legend(has_measured=True)
+        if n_vols > 1:
+            vol_handles = [
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="crimson",
+                    linestyle="-" if args.plot_type == "line" else "None",
+                    markersize=7,
+                    label=f"Vol {i}",
+                    alpha=0.4 + 0.6 * i / max(n_vols - 1, 1),
+                )
+                for i in range(n_vols)
+            ]
+            ax.legend(handles=extra_handles + vol_handles, fontsize=10)
+        else:
+            ax.legend(handles=extra_handles, fontsize=10)
+    else:
+        ax.legend(title="Volumes", fontsize=10)
+
+    # ---- ROI overlay subplot -----------------------------------------------
     if args.roi_image:
         ax_img = axes[1]
         img = mpimg.imread(args.roi_image)
@@ -102,6 +442,7 @@ def main():
     plt.savefig(output_file, bbox_inches="tight", dpi=300)
     print(f"[INFO] Plot saved to: {output_file}")
     plt.close(fig)
+
 
 if __name__ == "__main__":
     main()

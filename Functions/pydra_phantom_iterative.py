@@ -36,6 +36,10 @@ class PhantomProcessor:
         self.output_base_dir = Path(output_base_dir)
         self.rotation_library_file = rotation_library_file
 
+        # Phantom name is the last component of template_dir
+        # e.g. .../TemplateData/SPIRIT  →  "SPIRIT"
+        self.phantom_name = self.template_dir.name
+
         # Template files
         self.template_phantom = self.template_dir / "ImageTemplate.nii.gz"
         self.vial_dir = self.template_dir / "VialsLabelled"
@@ -606,10 +610,34 @@ class PhantomProcessor:
         session_name: str,
     ):
         """Extract metrics from one contrast image across all vials."""
-        contrast_name = contrast_file.stem
+        # Strip both .nii.gz and .nii so CSV filenames are clean
+        contrast_name = contrast_file.name
+        for ext in (".nii.gz", ".nii"):
+            if contrast_name.endswith(ext):
+                contrast_name = contrast_name[: -len(ext)]
+                break
 
-        # Remove file extensions from contrast name for cleaner labels
-        clean_contrast_name = contrast_name.replace(".nii", "").replace(".gz", "")
+        # Alias used for column headers inside the CSV
+        clean_contrast_name = contrast_name
+
+        # ADC is only defined for vials E–L; restrict processing accordingly
+        adc_vials = {"E", "F", "G", "H", "I", "J", "K", "L"}
+        contrast_type = self._classify_contrast(contrast_file)
+        if contrast_type == "adc":
+            original_count = len(vial_masks)
+            vial_masks = [
+                m
+                for m in vial_masks
+                if Path(m)
+                .name.replace(".nii.gz", "")
+                .replace(".nii", "")
+                .split(".")[0]
+                .upper()
+                in adc_vials
+            ]
+            print(
+                f"  [ADC mode] Restricting to vials E–L ({len(vial_masks)} of {original_count})"
+            )
 
         # Get number of volumes
         cmd = ["mrinfo", "-size", str(contrast_file)]
@@ -733,10 +761,49 @@ class PhantomProcessor:
 
         return metrics_data
 
+    @staticmethod
+    def _classify_contrast(contrast_file: Path) -> str:
+        """
+        Classify a contrast image by its filename stem.
+
+        Returns
+        -------
+        "adc"  – filename contains 'ADC' (case-insensitive)
+        "fa"   – filename contains 'FA'  (case-insensitive, whole-word match
+                  to avoid false hits on e.g. 'default')
+        None   – no special mode
+        """
+        import re as _re
+
+        stem = contrast_file.stem
+        if _re.search(r"ADC", stem, _re.IGNORECASE):
+            return "adc"
+        # Whole-word match for FA: must not be surrounded by alphanumerics
+        if _re.search(r"(?<![A-Za-z0-9])FA(?![A-Za-z0-9])", stem):
+            return "fa"
+        return None
+
     def _generate_mrview_screenshot(
-        self, contrast_file: Path, roi_overlay: str, output_image: str
+        self,
+        contrast_file: Path,
+        roi_overlay: str,
+        output_image: str,
+        intensity_range: tuple = None,
     ):
-        """Generate ROI overlay screenshot using mrview"""
+        """Generate ROI overlay screenshot using mrview.
+
+        Parameters
+        ----------
+        contrast_file : Path
+            Image to display as the background.
+        roi_overlay : str
+            Path to combined vial ROI NIfTI file.
+        output_image : str
+            Desired output path (mrview appends '0000' before the extension).
+        intensity_range : tuple (min, max), optional
+            If provided, passes ``-intensity_range min,max`` to mrview.
+            Used for FA maps where the display range should be fixed to 0–1.
+        """
         cmd = [
             "mrview",
             str(contrast_file),
@@ -744,6 +811,8 @@ class PhantomProcessor:
             "1",
             "-plane",
             "2",
+            "-interpolation",
+            "0",
             "-roi.load",
             roi_overlay,
             "-roi.colour",
@@ -754,13 +823,23 @@ class PhantomProcessor:
             "0",
             "-noannotations",
             "-fullscreen",
-            "-capture.folder",
-            str(Path(output_image).parent),
-            "-capture.prefix",
-            Path(output_image).stem,
-            "-capture.grab",
-            "-exit",
         ]
+
+        if intensity_range is not None:
+            cmd.extend(
+                ["-intensity_range", f"{intensity_range[0]},{intensity_range[1]}"]
+            )
+
+        cmd.extend(
+            [
+                "-capture.folder",
+                str(Path(output_image).parent),
+                "-capture.prefix",
+                Path(output_image).stem,
+                "-capture.grab",
+                "-exit",
+            ]
+        )
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -783,9 +862,12 @@ class PhantomProcessor:
     ):
         """Generate visualization plots for all contrasts"""
 
-        # Check if plotting scripts exist
+        # All plotting scripts live at <repo_root>/Functions/
+        # self.template_dir is <repo_root>/TemplateData/<phantom>/
+        # so .parent.parent reaches the repo root regardless of where
+        # pydra_phantom_iterative.py itself is located
         plot_vial_script = (
-            self.template_dir.parent / "Functions" / "plot_vial_intensity.py"
+            self.template_dir.parent.parent / "Functions" / "plot_vial_intensity.py"
         )
 
         if not plot_vial_script.exists():
@@ -798,13 +880,21 @@ class PhantomProcessor:
 
         # Generate plots for each contrast
         for contrast_file in contrast_files:
-            contrast_name = contrast_file.stem
+            # Strip both .nii.gz and .nii so the name matches what
+            # _extract_metrics_from_contrast wrote to the CSV filenames.
+            contrast_name = contrast_file.name
+            for ext in (".nii.gz", ".nii"):
+                if contrast_name.endswith(ext):
+                    contrast_name = contrast_name[: -len(ext)]
+                    break
 
             # CSV files
             mean_csv = metrics_dir / f"{session_name}_{contrast_name}_mean_matrix.csv"
             std_csv = metrics_dir / f"{session_name}_{contrast_name}_std_matrix.csv"
 
             if not mean_csv.exists():
+                print(f"  ⚠ Mean CSV not found, skipping plot for {contrast_name}")
+                print(f"    Expected: {mean_csv}")
                 continue
 
             # Output plot
@@ -862,13 +952,27 @@ class PhantomProcessor:
                     proc_cat.stdout.close()
                     proc_math.communicate()
 
-            # Generate mrview screenshot
+            # Detect contrast type for specialised plot modes
+            contrast_type = self._classify_contrast(contrast_file)
+
+            # Generate mrview screenshot with contrast-appropriate intensity range
             mrview_image = str(tmp_vial_dir / f"{contrast_name}_roi_overlay.png")
+            intensity_range = (
+                (0, 1)
+                if contrast_type == "fa"
+                else (0, 0.005) if contrast_type == "adc" else None
+            )
             actual_screenshot = self._generate_mrview_screenshot(
-                contrast_file, roi_overlay, mrview_image
+                contrast_file,
+                roi_overlay,
+                mrview_image,
+                intensity_range=intensity_range,
             )
 
             # Call plotting script
+            # Mode (ADC / FA / generic) is auto-detected inside the script
+            # from the csv filename.  We always pass --phantom and --template_dir
+            # so the script has what it needs if ADC mode activates.
             cmd = [
                 "python",
                 str(plot_vial_script),
@@ -878,6 +982,10 @@ class PhantomProcessor:
                 str(std_csv),
                 "--output",
                 str(output_plot),
+                "--phantom",
+                self.phantom_name,
+                "--template_dir",
+                str(self.template_dir.parent),
             ]
 
             if actual_screenshot and Path(actual_screenshot).exists():
@@ -889,8 +997,10 @@ class PhantomProcessor:
                 print(f"    ✓ Generated plot: {output_plot.name}")
             else:
                 print(f"    ✗ Plot generation failed for {contrast_name}")
+                if result.stdout:
+                    print(f"      stdout: {result.stdout.strip()}")
                 if result.stderr:
-                    print(f"      {result.stderr}")
+                    print(f"      stderr: {result.stderr.strip()}")
 
         # Generate parametric map plots (IR and TE)
         self._generate_parametric_plots(
@@ -924,7 +1034,9 @@ class PhantomProcessor:
             print(
                 f"  Found {len(ir_contrasts)} IR contrasts: {[f.name for f in ir_contrasts]}"
             )
-            plot_script = self.template_dir.parent / "plot_maps_ir.py"
+            plot_script = (
+                self.template_dir.parent.parent / "Functions" / "plot_maps_ir.py"
+            )
             if plot_script.exists():
                 output_plot = (
                     metrics_dir / f"{session_name}_ir_map_PLOTmeanstd_TEmapping.png"
@@ -1029,7 +1141,9 @@ class PhantomProcessor:
             print(
                 f"  Found {len(te_contrasts)} TE contrasts: {[f.name for f in te_contrasts]}"
             )
-            plot_script = self.template_dir.parent / "plot_maps_TE.py"
+            plot_script = (
+                self.template_dir.parent.parent / "Functions" / "plot_maps_TE.py"
+            )
             if plot_script.exists():
                 output_plot = (
                     metrics_dir / f"{session_name}_TE_map_PLOTmeanstd_TEmapping.png"
