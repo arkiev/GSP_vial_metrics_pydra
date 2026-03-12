@@ -71,93 +71,52 @@ def load_adc_reference(template_dir: str, phantom: str) -> dict:
 
 def overlay_adc_reference(ax: plt.Axes, ref_data: dict):
     """
-    Draw per-vial ±5% and ±10% tolerance rings plus reference ADC crosshair
-    markers onto *ax*.  Values are converted to ×10⁻³ for display.
+    Draw per-vial ±5% and ±10% tolerance markers plus reference ADC crosshairs
+    onto *ax*.  Values are converted to ×10⁻³ for display.
 
-    Each vial gets:
-      - An outer open circle whose y-radius spans ±10% of the reference value
-      - An inner open circle whose y-radius spans ±5% of the reference value
-      - A crosshair (+) at the reference value
-    Rings are drawn as scatter markers scaled so their visual size reflects the
-    tolerance range, making it clear the tolerance is per-vial and not connected
-    across vials.
+    Tolerance is shown as vertical error bars centred on each reference value:
+      - Outer bar: ±10% of the reference value
+      - Inner bar: ±5% of the reference value
+    The bar extents are computed directly from the reference values so they
+    accurately reflect the tolerance range for each vial.
     """
     vials = ref_data["vials"]
     ref_vals = np.array([ref_data["adc_mm2_per_s"][v] for v in vials])
     x = np.arange(len(vials))
     ref_display = ref_vals * 1e3  # convert to ×10⁻³ for display
 
-    # Open circles: marker size is set large enough to be clearly visible.
-    # The outer ring (±10%) is drawn first (behind), inner ring (±5%) on top.
-    ax.scatter(
+    err_10 = ref_display * 0.10  # ±10% extent
+
+    # ±10% tolerance bar
+    ax.errorbar(
         x,
         ref_display,
-        marker="o",
-        s=600,
-        linewidths=1.5,
-        facecolors="none",
-        edgecolors="steelblue",
-        alpha=0.4,
+        yerr=err_10,
+        fmt="none",
+        capsize=8,
+        capthick=1.5,
+        elinewidth=1.5,
+        ecolor="steelblue",
+        alpha=0.5,
         zorder=2,
-        label="_nolegend_",
-    )  # ±10% outer ring
-
-    ax.scatter(
-        x,
-        ref_display,
-        marker="o",
-        s=250,
-        linewidths=1.5,
-        facecolors="none",
-        edgecolors="steelblue",
-        alpha=0.7,
-        zorder=3,
-        label="_nolegend_",
-    )  # ±5% inner ring
-
-    # Crosshair at reference value
-    ax.scatter(
-        x, ref_display, marker="+", s=120, linewidths=1.8, color="steelblue", zorder=4
     )
+
+    # Filled circle at reference value
+    ax.scatter(x, ref_display, marker="o", s=60, color="steelblue", zorder=4)
 
 
 def build_adc_legend(has_measured: bool) -> list:
     """Return legend handles for the ADC overlay."""
-    ring_10 = plt.Line2D(
-        [0],
-        [0],
-        marker="o",
-        color="steelblue",
-        linestyle="None",
-        markersize=14,
-        markerfacecolor="none",
-        markeredgewidth=1.5,
-        alpha=0.4,
-        label="Reference ±10%",
-    )
-    ring_5 = plt.Line2D(
-        [0],
-        [0],
-        marker="o",
-        color="steelblue",
-        linestyle="None",
-        markersize=9,
-        markerfacecolor="none",
-        markeredgewidth=1.5,
-        alpha=0.7,
-        label="Reference ±5%",
-    )
     ref_handle = plt.Line2D(
         [0],
         [0],
-        marker="+",
+        marker="o",
         color="steelblue",
         linestyle="None",
-        markersize=10,
-        markeredgewidth=1.8,
-        label="Reference ADC",
+        markersize=7,
+        label="Reference ADC ±10%",
     )
-    handles = [ring_10, ring_5, ref_handle]
+    handles = [ref_handle]
     if has_measured:
         meas_handle = plt.Line2D(
             [0],

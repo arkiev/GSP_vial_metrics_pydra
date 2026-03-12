@@ -3,8 +3,12 @@
 DWI processing and tensor metrics pipeline (Pydra 0.23+)
 
 Usage:
-    python pydra_dwi_processing.py --config pydra_dwi_processing.yaml
-    python pydra_dwi_processing.py --scans-dir /path/to/scans --output-dir /path/to/out [options]
+    python Functions/pydra_dwi_processing.py --config pydra_dwi_processing.yaml
+    python Functions/pydra_dwi_processing.py --scans-dir /path/to/scans --output-dir /path/to/out [options]
+
+Options:
+    --nocleanup     Keep the tmp/ intermediate file directory after processing
+                    (default: tmp/ is removed once final outputs are copied)
 
 Output structure:
     <output_dir>/
@@ -13,7 +17,7 @@ Output structure:
             FA.nii.gz
             DWI_preproc_biascorr.mif.gz   (or DWI_denoise_gibbs_preproc_biascorr.mif.gz)
             T1_n4_in_DWI_space.nii.gz
-            tmp/                           (all intermediate files)
+            tmp/                           (intermediate files — removed unless --nocleanup)
 """
 
 import argparse
@@ -990,6 +994,7 @@ def plan_workflow(
     do_denoise = cfg.get("denoise_degibbs", False)
     do_gradcheck = cfg.get("gradcheck", False)
     eddy_options = cfg.get("eddy_options", " --slm=linear")
+    keep_tmp = cfg.get("keep_tmp", False)
 
     dwi_preproc_name = (
         "DWI_denoise_gibbs_preproc_biascorr.mif.gz"
@@ -1029,6 +1034,7 @@ def plan_workflow(
         "do_denoise": do_denoise,
         "do_gradcheck": do_gradcheck,
         "eddy_options": eddy_options,
+        "keep_tmp": keep_tmp,
         "dwi_preproc_name": dwi_preproc_name,
         "out_dir": out_dir,
         "tmp_dir": tmp_dir,
@@ -1358,7 +1364,7 @@ def invert_and_apply_transform(b02t1_mat: str, t1_nii: str, b0_nii: str, tmp_dir
             "-in",
             t1_nii,
             "-ref",
-            b0_nii,
+            t1_nii,
             "-out",
             t1_in_dwi,
             "-init",
@@ -1413,6 +1419,22 @@ def copy_final_outputs(
     return (dst_dwi, dst_t1, dst_adc, dst_fa)
 
 
+@pydra.mark.task
+def cleanup_tmp(sentinel: str, tmp_dir: str, keep_tmp: bool) -> str:
+    """
+    Remove the tmp directory after all outputs have been copied.
+    Skipped if keep_tmp is True (--nocleanup flag).
+    sentinel: any upstream output — used only to enforce task ordering.
+    """
+    if keep_tmp:
+        print(f"  --nocleanup set: retaining {tmp_dir}")
+        return tmp_dir
+    if Path(tmp_dir).exists():
+        shutil.rmtree(tmp_dir)
+        print(f"  Removed tmp directory: {tmp_dir}")
+    return tmp_dir
+
+
 # =============================================================================
 # Per-DWI workflow builder
 # =============================================================================
@@ -1434,6 +1456,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
     do_gradcheck = plan["do_gradcheck"]
     readout_time = plan["readout_time"]
     eddy_options = plan["eddy_options"]
+    keep_tmp = plan["keep_tmp"]
     dwi_preproc_name = plan["dwi_preproc_name"]
 
     dwi_nii = plan["dwi_nii"]
@@ -1773,7 +1796,19 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
         )
     )
 
-    wf.set_output([("outputs", wf.copy_outputs.lzout.dwi_biascorr)])
+    # ------------------------------------------------------------------
+    # Cleanup tmp (skipped if --nocleanup)
+    # ------------------------------------------------------------------
+    wf.add(
+        cleanup_tmp(
+            name="cleanup",
+            sentinel=wf.copy_outputs.lzout.dwi_biascorr,
+            tmp_dir=tmp_dir,
+            keep_tmp=keep_tmp,
+        )
+    )
+
+    wf.set_output([("outputs", wf.cleanup.lzout.out)])
     return wf
 
 
@@ -1791,6 +1826,7 @@ def run_pipeline(cfg: dict):
     print(f"Scans directory:  {scans_dir}")
     print(f"Denoise/Degibbs:  {cfg.get('denoise_degibbs', False)}")
     print(f"Gradcheck:        {cfg.get('gradcheck', False)}")
+    print(f"Keep tmp:         {cfg.get('keep_tmp', False)}")
     print(f"Output:           {Path(output_dir).resolve()}")
 
     # Step 1: classify directories (provisional)
@@ -1901,6 +1937,8 @@ def load_config(args) -> dict:
         cfg["denoise_degibbs"] = True
     if args.gradcheck:
         cfg["gradcheck"] = True
+    if args.nocleanup:
+        cfg["keep_tmp"] = True
     if args.readout_time is not None:
         cfg["readout_time"] = args.readout_time
     if args.eddy_options is not None:
@@ -1919,6 +1957,12 @@ def main():
     parser.add_argument("--output-dir", type=str, help="Path to output directory")
     parser.add_argument("--denoise-degibbs", action="store_true", default=None)
     parser.add_argument("--gradcheck", action="store_true", default=None)
+    parser.add_argument(
+        "--nocleanup",
+        action="store_true",
+        default=False,
+        help="Keep the tmp/ directory after processing (default: remove)",
+    )
     parser.add_argument("--readout-time", type=float, default=None)
     parser.add_argument("--eddy-options", type=str, default=None)
     args = parser.parse_args()
