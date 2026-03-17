@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-T2 Multi-Echo Spin Echo Plotting Script
+T1 Inversion Recovery Plotting Script
 ================================================================================
 This script reads mean and standard deviation data from CSV files for multiple
-echo time (TE) contrast images, plots them grouped by vials, and fits a
-mono-exponential T2 decay model to estimate T2 relaxation times.
+inversion time (TI) contrast images, plots them grouped by vials, and fits an
+inversion recovery model to estimate T1 relaxation times.
 
 Key outputs:
-- Publication-quality 3x3 grid plot of intensity vs echo time
-- CSV file with fitted T2 values and R² statistics
+- Publication-quality 3x3 grid plot of intensity vs inversion time
+- CSV file with fitted T1 values and R² statistics
 ================================================================================
 """
 
-import pandas as pd
-import matplotlib.pyplot as plt
+import logging
 import os
-import numpy as np
-import argparse
 import re
+
+import argparse
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from scipy.optimize import curve_fit
+
+logger = logging.getLogger(__name__)
 
 
 def find_csv_file(metric_dir, contrast_name, suffix):
@@ -28,8 +32,8 @@ def find_csv_file(metric_dir, contrast_name, suffix):
 
     Uses an exact token match: the contrast_name must appear in the filename
     immediately followed by the suffix (no extra characters between them).
-    This prevents ambiguous substring hits such as 't2_se_TE_14' matching
-    't2_se_TE_140_mean_matrix.csv'.
+    This prevents ambiguous substring hits such as 'se_ir_100' matching
+    'se_ir_1000_mean_matrix.csv' or 'se_ir_50' matching 'se_ir_500_mean_matrix.csv'.
 
     Args:
         metric_dir: Directory containing CSV files
@@ -55,7 +59,7 @@ def extract_numeric(label):
     """
     Extract the last numeric value from a string label.
 
-    Used to extract echo times from filenames (e.g., 'SE_80' → 80)
+    Used to extract inversion times from filenames (e.g., 'IR_500' → 500)
 
     Args:
         label: String containing numbers (e.g., 'contrast_100')
@@ -67,21 +71,22 @@ def extract_numeric(label):
     return int(numbers[-1]) if numbers else None
 
 
-def mono_exp(te, S0, T2):
+# Inversion recovery model for magnitude data
+def inv_rec(ti, S0, T1):
     """
-    Mono-exponential T2 decay model for spin echo MRI data.
+    Inversion recovery signal model for magnitude MRI data.
 
-    Model: S0 * exp(-TE/T2)
+    Model: |S0 * (1 - 2 * exp(-TI/T1))|
 
     Args:
-        te: Echo time (ms) - can be scalar or array
-        S0: Initial signal intensity at TE=0
-        T2: Transverse relaxation time (ms)
+        ti: Inversion time (ms) - can be scalar or array
+        S0: Equilibrium signal intensity
+        T1: Longitudinal relaxation time (ms)
 
     Returns:
-        Signal intensity at given echo time(s)
+        Signal intensity at given inversion time(s)
     """
-    return S0 * np.exp(-te / T2)
+    return np.abs(S0 * (1 - 2 * np.exp(-ti / T1)))
 
 
 def calc_r2(y_true, y_pred):
@@ -104,25 +109,28 @@ def calc_r2(y_true, y_pred):
     return 1 - (ss_res / ss_tot)
 
 
-def plot_vial_means_std_pub_from_nifti(
-    contrast_files,
-    metric_dir,
-    output_file="vial_summary_pub.png",
-    annotate=False,
-    roi_image=None,
-):
+def plot_vial_ir_means_std(
+    contrast_files: list[str],
+    metric_dir: str,
+    output_file: str = "vial_summary_T1.png",
+    annotate: bool = False,
+    roi_image: str | None = None,
+) -> str:
     """
-    Create publication-quality plots of vial intensity data with T2 curve fitting.
+    Create publication-quality plots of vial intensity data with T1 curve fitting.
 
-    Generates a 3x3 grid of subplots showing intensity vs echo time for
-    different vial groups, with fitted T2 decay curves overlaid on the measured data.
+    Generates a 3x3 grid of subplots showing intensity vs inversion time for
+    different vial groups, with fitted T1 curves overlaid on the measured data.
 
     Args:
-        contrast_files: List of NIfTI file paths for different echo times
+        contrast_files: List of NIfTI file paths for different inversion times
         metric_dir: Directory containing mean/std CSV files
-        output_file: Output filename for the plot (default: 'vial_summary_pub.png')
+        output_file: Output filename for the plot (default: 'vial_summary_T1.png')
         annotate: Whether to annotate points with mean ± std (not currently used)
         roi_image: Optional path to ROI overlay image for extra subplot
+
+    Returns:
+        Absolute path to the saved plot file.
     """
 
     # ========================================================================
@@ -147,11 +155,11 @@ def plot_vial_means_std_pub_from_nifti(
     # DATA LOADING: Read mean and std deviation from CSV files
     # ========================================================================
     vial_labels = None  # Vial identifiers (e.g., ['A', 'B', 'C', ...])
-    contrast_numbers = []  # Echo times extracted from filenames
-    mean_matrix = []  # Mean intensity values for each vial at each TE
+    contrast_numbers = []  # Inversion times extracted from filenames
+    mean_matrix = []  # Mean intensity values for each vial at each TI
     std_matrix = []  # Standard deviation values
 
-    # Loop through each contrast file (different echo times)
+    # Loop through each contrast file (different inversion times)
     for nifti_path in contrast_files:
         # Extract base filename without extension
         base_name = os.path.basename(nifti_path).replace(".nii.gz", "")
@@ -168,7 +176,7 @@ def plot_vial_means_std_pub_from_nifti(
         if vial_labels is None:
             vial_labels = mean_df.iloc[:, 0].astype(str).tolist()
 
-        # Extract intensity values (column 1) and echo time from filename
+        # Extract intensity values (column 1) and inversion time from filename
         mean_matrix.append(mean_df.iloc[:, 1].to_numpy())
         std_matrix.append(std_df.iloc[:, 1].to_numpy())
         contrast_numbers.append(extract_numeric(base_name))
@@ -178,12 +186,12 @@ def plot_vial_means_std_pub_from_nifti(
     std_matrix = np.array(std_matrix)
 
     # ========================================================================
-    # DATA ORGANIZATION: Sort by echo time and transpose
+    # DATA ORGANIZATION: Sort by inversion time and transpose
     # ========================================================================
-    # Sort all data by echo time (ascending order)
+    # Sort all data by inversion time (ascending order)
     sort_idx = np.argsort(contrast_numbers)
     contrast_numbers = np.array(contrast_numbers)[sort_idx]
-    mean_matrix = mean_matrix[sort_idx].T  # Transpose so rows=vials, cols=TE
+    mean_matrix = mean_matrix[sort_idx].T  # Transpose so rows=vials, cols=TI
     std_matrix = std_matrix[sort_idx].T
 
     # Create mapping from vial label to row index for quick lookup
@@ -225,7 +233,7 @@ def plot_vial_means_std_pub_from_nifti(
 
             # Plot error bars only (no markers, no line)
             ax.errorbar(
-                contrast_numbers,  # x-axis: echo times (ms)
+                contrast_numbers,  # x-axis: inversion times (ms)
                 mean_matrix[i, :],  # y-axis: mean intensity values
                 yerr=std_matrix[i, :],  # error bars: ± standard deviation
                 fmt="none",  # NO markers or lines (error bars only)
@@ -236,7 +244,7 @@ def plot_vial_means_std_pub_from_nifti(
 
             # Plot scatter points on top
             ax.scatter(
-                contrast_numbers,  # x-axis: echo times (ms)
+                contrast_numbers,  # x-axis: inversion times (ms)
                 mean_matrix[i, :],  # y-axis: mean intensity values
                 s=50,  # marker size
                 color="black",  # marker color
@@ -246,25 +254,26 @@ def plot_vial_means_std_pub_from_nifti(
             )
             # ================================================================
 
-            # Attempt to fit T2 mono-exponential decay curve to the data
+            # Attempt to fit T1 inversion recovery curve to the data
             try:
                 # Non-linear least squares curve fitting
-                # Keep covariance matrix for CI calculation
+                # Keep the covariance matrix (pcov) for confidence interval calculation
                 popt, pcov = curve_fit(
-                    mono_exp,  # Model function to fit
-                    contrast_numbers,  # x data (echo times)
+                    inv_rec,  # Model function to fit
+                    contrast_numbers,  # x data (inversion times)
                     mean_matrix[i, :],  # y data (intensities)
-                    p0=(mean_matrix[i, 0], 100),  # Initial guesses: [S0, T2]
+                    p0=(mean_matrix[i, -1], 1000),  # Initial guesses: [S0, T1]
+                    maxfev=5000,  # Max iterations
                 )
-                S0_fit, T2_fit = popt  # Extract fitted parameters
+                S0_fit, T1_fit = popt  # Extract fitted parameters
 
                 # Calculate fitted curve and goodness of fit (R²)
-                fit_signal = mono_exp(contrast_numbers, *popt)
+                fit_signal = inv_rec(contrast_numbers, *popt)
                 r2 = calc_r2(mean_matrix[i, :], fit_signal)
 
                 # Store fit results for CSV output
                 fit_results.append(
-                    {"Vial": vial, "S0": S0_fit, "T2_ms": T2_fit, "R2": r2}
+                    {"Vial": vial, "S0": S0_fit, "T1_ms": T1_fit, "R2": r2}
                 )
 
                 # ============================================================
@@ -284,7 +293,7 @@ def plot_vial_means_std_pub_from_nifti(
                     # Generate predictions for each parameter sample
                     predictions = np.array(
                         [
-                            mono_exp(x_fit, sample[0], sample[1])
+                            inv_rec(x_fit, sample[0], sample[1])
                             for sample in param_samples
                         ]
                     )
@@ -295,7 +304,9 @@ def plot_vial_means_std_pub_from_nifti(
 
                 except (np.linalg.LinAlgError, ValueError) as e:
                     # Covariance matrix might be singular or ill-conditioned
-                    print(f"[WARN] Could not calculate 95% CI for vial {vial}: {e}")
+                    logger.warning(
+                        "Could not calculate 95%% CI for vial %s: %s", vial, e
+                    )
 
                 # ============================================================
                 # *** FITTED CURVE AND CI BAND PLOTTING ***
@@ -315,16 +326,16 @@ def plot_vial_means_std_pub_from_nifti(
                 # Plot smooth fitted curve (dashed line) over data
                 ax.plot(
                     x_fit,
-                    mono_exp(x_fit, *popt),
+                    inv_rec(x_fit, *popt),
                     "--",  # Dashed line style
                     color="gray",  # Gray color for fitted curve
                     alpha=0.8,  # Slight transparency
                     zorder=2,  # On top of CI band, below data
-                    label="T₂ fit",  # Legend label
+                    label="T₁ fit",  # Legend label
                 )
             except RuntimeError:
                 # Curve fitting failed for this vial
-                print(f"[WARN] Could not fit T₂ for vial {vial}")
+                logger.warning("Could not fit T\u2081 for vial %s", vial)
 
         # --------------------------------------------------------------------
         # CASE 2: Multiple vials in one subplot
@@ -343,7 +354,7 @@ def plot_vial_means_std_pub_from_nifti(
 
                 # Plot error bars only (no markers, no line)
                 ax.errorbar(
-                    contrast_numbers,  # x-axis: echo times (ms)
+                    contrast_numbers,  # x-axis: inversion times (ms)
                     mean_matrix[i, :],  # y-axis: mean intensity values
                     yerr=std_matrix[i, :],  # error bars: ± standard deviation
                     fmt="none",  # NO markers or lines (error bars only)
@@ -354,7 +365,7 @@ def plot_vial_means_std_pub_from_nifti(
 
                 # Plot scatter points on top
                 ax.scatter(
-                    contrast_numbers,  # x-axis: echo times (ms)
+                    contrast_numbers,  # x-axis: inversion times (ms)
                     mean_matrix[i, :],  # y-axis: mean intensity values
                     s=50,  # marker size
                     color=cmap(j % 10),  # marker color from colormap
@@ -364,25 +375,26 @@ def plot_vial_means_std_pub_from_nifti(
                 )
                 # ============================================================
 
-                # Attempt to fit T2 mono-exponential decay curve
+                # Attempt to fit T1 inversion recovery curve
                 try:
                     # Non-linear least squares curve fitting
                     # Keep covariance matrix for CI calculation
                     popt, pcov = curve_fit(
-                        mono_exp,
+                        inv_rec,
                         contrast_numbers,
                         mean_matrix[i, :],
-                        p0=(mean_matrix[i, 0], 100),
+                        p0=(mean_matrix[i, -1], 1000),
+                        maxfev=5000,
                     )
-                    S0_fit, T2_fit = popt
+                    S0_fit, T1_fit = popt
 
                     # Calculate fitted curve and R²
-                    fit_signal = mono_exp(contrast_numbers, *popt)
+                    fit_signal = inv_rec(contrast_numbers, *popt)
                     r2 = calc_r2(mean_matrix[i, :], fit_signal)
 
                     # Store fit results
                     fit_results.append(
-                        {"Vial": vial, "S0": S0_fit, "T2_ms": T2_fit, "R2": r2}
+                        {"Vial": vial, "S0": S0_fit, "T1_ms": T1_fit, "R2": r2}
                     )
 
                     # ========================================================
@@ -406,7 +418,7 @@ def plot_vial_means_std_pub_from_nifti(
                         # Generate predictions
                         predictions = np.array(
                             [
-                                mono_exp(x_fit, sample[0], sample[1])
+                                inv_rec(x_fit, sample[0], sample[1])
                                 for sample in param_samples
                             ]
                         )
@@ -435,14 +447,14 @@ def plot_vial_means_std_pub_from_nifti(
                     # Plot smooth fitted curve (dashed, same color as data)
                     ax.plot(
                         x_fit,
-                        mono_exp(x_fit, *popt),
+                        inv_rec(x_fit, *popt),
                         "--",  # Dashed line
                         color=cmap(j % 10),  # Match data color
                         alpha=0.8,
                         zorder=2,  # On top of CI, below data
                     )
                 except RuntimeError:
-                    print(f"[WARN] Could not fit T₂ for vial {vial}")
+                    print(f"[WARN] Could not fit T₁ for vial {vial}")
 
             # Add legend for multi-vial subplots
             ax.legend(loc="upper right", fontsize=8)
@@ -492,29 +504,26 @@ def plot_vial_means_std_pub_from_nifti(
     # ========================================================================
     plt.tight_layout(rect=[0, 0, 1, 1])
     plt.savefig(output_file, dpi=300, bbox_inches="tight")
-    print(f"[INFO] Publication-ready plot saved to {output_file}")
+    logger.info("Publication-ready plot saved to %s", output_file)
 
-    # Save fitted T2 values to CSV
-    csv_output = os.path.splitext(output_file)[0] + "_T2_fits.csv"
+    # Save fitted T1 values to CSV
+    csv_output = os.path.splitext(output_file)[0] + "_T1_fits.csv"
     pd.DataFrame(fit_results).to_csv(csv_output, index=False)
-    print(f"[INFO] Fitted parameters saved to {csv_output}")
+    logger.info("Fitted parameters saved to %s", csv_output)
 
     plt.close(fig)
+    return os.path.abspath(output_file)
 
 
 def main():
-    """
-    Command-line interface for the T2 plotting script.
-    
-    Example usage:
-        python plot_maps_TE.py echo1.nii.gz echo2.nii.gz \
-               -m /path/to/metrics/ -o output_plot.png
-    """
+    """Plot vial mean ± std for inversion recovery with T₁ fitting and save fit metrics."""
     parser = argparse.ArgumentParser(
-        description="Plot grouped vial mean ± std with mono-exponential T₂ fitting and save fit metrics."
+        description="Plot T1 inversion recovery curves with curve fitting."
     )
     parser.add_argument(
-        "contrast_files", nargs="+", help="Full paths to NIfTI contrast images."
+        "contrast_files",
+        nargs="+",
+        help="NIfTI file paths for each inversion time contrast.",
     )
     parser.add_argument(
         "-m",
@@ -525,18 +534,22 @@ def main():
     parser.add_argument(
         "-o",
         "--output",
-        default="vial_summary_pub.png",
-        help="Output filename for the plot.",
+        default="vial_summary_T1.png",
+        help="Output filename for the plot (default: vial_summary_T1.png).",
     )
     parser.add_argument(
-        "--annotate", action="store_true", help="Annotate each point with mean ± std."
+        "--annotate",
+        action="store_true",
+        help="Annotate each point with mean ± std.",
     )
     parser.add_argument(
-        "--roi_image", help="Path to ROI overlay PNG image for the extra subplot."
+        "--roi_image",
+        default=None,
+        help="Path to ROI overlay PNG image for the extra subplot.",
     )
-
     args = parser.parse_args()
-    plot_vial_means_std_pub_from_nifti(
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    plot_vial_ir_means_std(
         args.contrast_files,
         metric_dir=args.metric_dir,
         output_file=args.output,

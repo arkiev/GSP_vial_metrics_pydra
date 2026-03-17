@@ -1039,7 +1039,7 @@ class PhantomProcessor:
             )
             if plot_script.exists():
                 output_plot = (
-                    metrics_dir / f"{session_name}_ir_map_PLOTmeanstd_TEmapping.png"
+                    metrics_dir / f"{session_name}_ir_map_PLOTmeanstd_T1mapping.png"
                 )
 
                 # Generate ROI overlay for first IR image
@@ -1314,8 +1314,15 @@ class PhantomProcessor:
 
         import shutil as _shutil
 
-        # Gather all contrast images in the session folder
-        contrast_files = list(input_path.parent.glob("*.nii.gz"))
+        # Gather all contrast images in the session folder, excluding the
+        # template phantom warped to scanner space (which is a derived QC
+        # image, not an acquired contrast, and must not be re-transformed
+        # or plotted as if it were one).
+        contrast_files = [
+            f
+            for f in input_path.parent.glob("*.nii.gz")
+            if f.name != "TemplatePhantom_ScannerSpace.nii.gz"
+        ]
 
         # ------------------------------------------------------------------
         # SUBJECT-SPACE PIPELINE

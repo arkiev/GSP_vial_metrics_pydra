@@ -1002,6 +1002,12 @@ def plan_workflow(
         else "DWI_preproc_biascorr.mif.gz"
     )
 
+    # T1 output filename depends on whether registration was performed.
+    # rpe_none: no registration, so "T1_n4_in_DWI_space" is misleading.
+    t1_output_name = (
+        "T1_n4.nii.gz" if preproc_mode == "rpe_none" else "T1_n4_in_DWI_space.nii.gz"
+    )
+
     rpe_conv = conversions.get(rpe_dir_path) if rpe_dir_path else None
     fwd_conv = conversions.get(fwd_pe_dir_used) if fwd_pe_dir_used else None
 
@@ -1036,6 +1042,7 @@ def plan_workflow(
         "eddy_options": eddy_options,
         "keep_tmp": keep_tmp,
         "dwi_preproc_name": dwi_preproc_name,
+        "t1_output_name": t1_output_name,
         "out_dir": out_dir,
         "tmp_dir": tmp_dir,
         "warnings": warnings,
@@ -1100,6 +1107,16 @@ def print_plan(plans: list, skipped: list):
             )
 
         print(f"  Output:         {p['out_dir']}")
+
+        if p["preproc_mode"] == "rpe_none":
+            print(
+                f"  WARNING: preproc_mode is rpe_none — B0-to-T1 co-registration "
+                f"will be SKIPPED.\n"
+                f"           The native N4-corrected T1 will be used in place of "
+                f"T1_n4_in_DWI_space.nii.gz.\n"
+                f"           Consider acquiring a reverse PE image to enable "
+                f"distortion correction and accurate co-registration."
+            )
 
         for w in p["warnings"]:
             print(f"  WARNING: {w}")
@@ -1377,6 +1394,32 @@ def invert_and_apply_transform(b02t1_mat: str, t1_nii: str, b0_nii: str, tmp_dir
 
 
 @pydra.mark.task
+@pydra.mark.annotate({"return": {"t1_in_dwi": str}})
+def copy_t1_as_dwi_space(t1_nii: str, tmp_dir: str):
+    """
+    rpe_none fallback: copy the N4-corrected T1 directly to
+    T1_n4_in_DWI_space.nii.gz without performing any registration.
+
+    B0-to-T1 co-registration is unreliable when no distortion correction
+    is applied (rpe_none), so the native T1 is used as-is.  Stage 2 of the
+    orchestrator (phantom QC in DWI space) will therefore operate on the
+    native T1 geometry rather than a registered approximation.
+    """
+    print(
+        "\n  WARNING: preproc_mode is rpe_none — B0-to-T1 co-registration has been "
+        "SKIPPED.\n"
+        "  The native N4-corrected T1 will be saved as T1_n4.nii.gz.\n"
+        "  Vial metrics extracted from ADC/FA maps will use the T1 native space,\n"
+        "  not the DWI space.  Consider acquiring a reverse PE image to enable\n"
+        "  distortion correction and accurate co-registration.\n"
+    )
+    t1_out = str(Path(tmp_dir) / "T1_n4.nii.gz")
+    shutil.copy2(t1_nii, t1_out)
+    print(f"  Copied T1 (no registration): {Path(t1_out).name}")
+    return t1_out
+
+
+@pydra.mark.task
 @pydra.mark.annotate({"return": {"adc": str, "fa": str}})
 def compute_tensor_metrics(dwi_biascorr_mif: str, tmp_dir: str):
     tensor_mif = str(Path(tmp_dir) / "tensor.mif.gz")
@@ -1393,7 +1436,7 @@ def compute_tensor_metrics(dwi_biascorr_mif: str, tmp_dir: str):
 
 @pydra.mark.task
 @pydra.mark.annotate(
-    {"return": {"dwi_biascorr": str, "t1_in_dwi": str, "adc": str, "fa": str}}
+    {"return": {"dwi_biascorr": str, "t1_out": str, "adc": str, "fa": str}}
 )
 def copy_final_outputs(
     dwi_biascorr_mif: str,
@@ -1402,10 +1445,11 @@ def copy_final_outputs(
     fa_nii: str,
     out_dir: str,
     dwi_preproc_name: str,
+    t1_output_name: str,
 ):
     os.makedirs(out_dir, exist_ok=True)
     dst_dwi = str(Path(out_dir) / dwi_preproc_name)
-    dst_t1 = str(Path(out_dir) / "T1_n4_in_DWI_space.nii.gz")
+    dst_t1 = str(Path(out_dir) / t1_output_name)
     dst_adc = str(Path(out_dir) / "ADC.nii.gz")
     dst_fa = str(Path(out_dir) / "FA.nii.gz")
     for src, dst in [
@@ -1458,6 +1502,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
     eddy_options = plan["eddy_options"]
     keep_tmp = plan["keep_tmp"]
     dwi_preproc_name = plan["dwi_preproc_name"]
+    t1_output_name = plan["t1_output_name"]
 
     dwi_nii = plan["dwi_nii"]
     dwi_json = plan["dwi_json"]
@@ -1491,7 +1536,7 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
         run_n4(
             name="n4_t1",
             t1_nii=wf.convert_t1.lzout.nii,
-            out_nii=str(Path(tmp_dir) / "T1_n4.nii.gz"),
+            out_nii=str(Path(tmp_dir) / "T1_n4_biascorr.nii.gz"),
         )
     )
 
@@ -1738,37 +1783,53 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
     )
 
     # ------------------------------------------------------------------
-    # Mean b0 extraction
+    # T1-to-DWI co-registration
+    #
+    # rpe_none: distortion correction was not applied, so the mean b0
+    # and T1 come from very different geometric spaces.  Co-registration
+    # in this case tends to fail or produce misleading results.  Instead
+    # the N4-corrected T1 is copied directly to T1_n4_in_DWI_space.nii.gz
+    # and a warning is printed.
+    #
+    # All other modes: extract mean b0, register to T1, invert and apply
+    # the transform to bring the T1 into DWI space.
     # ------------------------------------------------------------------
-    wf.add(
-        extract_mean_b0(
-            name="mean_b0",
-            dwi_biascorr_mif=wf.dwi_biascorr.lzout.out,
-            out_nii=str(Path(tmp_dir) / "bzero_f.nii.gz"),
+    if preproc_mode == "rpe_none":
+        wf.add(
+            copy_t1_as_dwi_space(
+                name="skip_registration",
+                t1_nii=wf.n4_t1.lzout.out,
+                tmp_dir=tmp_dir,
+            )
         )
-    )
-
-    # ------------------------------------------------------------------
-    # Registration (T1 and DWI branches converge here)
-    # ------------------------------------------------------------------
-    wf.add(
-        register_b0_to_t1(
-            name="register",
-            b0_nii=wf.mean_b0.lzout.out,
-            t1_nii=wf.n4_t1.lzout.out,
-            out_b0_in_t1=str(Path(tmp_dir) / "b0_to_T1.nii.gz"),
-            out_mat=str(Path(tmp_dir) / "b02T1.mat"),
+        t1_in_dwi_out = wf.skip_registration.lzout.t1_in_dwi
+    else:
+        wf.add(
+            extract_mean_b0(
+                name="mean_b0",
+                dwi_biascorr_mif=wf.dwi_biascorr.lzout.out,
+                out_nii=str(Path(tmp_dir) / "bzero_f.nii.gz"),
+            )
         )
-    )
-    wf.add(
-        invert_and_apply_transform(
-            name="invert_xfm",
-            b02t1_mat=wf.register.lzout.b02t1_mat,
-            t1_nii=wf.n4_t1.lzout.out,
-            b0_nii=wf.mean_b0.lzout.out,
-            tmp_dir=tmp_dir,
+        wf.add(
+            register_b0_to_t1(
+                name="register",
+                b0_nii=wf.mean_b0.lzout.out,
+                t1_nii=wf.n4_t1.lzout.out,
+                out_b0_in_t1=str(Path(tmp_dir) / "b0_to_T1.nii.gz"),
+                out_mat=str(Path(tmp_dir) / "b02T1.mat"),
+            )
         )
-    )
+        wf.add(
+            invert_and_apply_transform(
+                name="invert_xfm",
+                b02t1_mat=wf.register.lzout.b02t1_mat,
+                t1_nii=wf.n4_t1.lzout.out,
+                b0_nii=wf.mean_b0.lzout.out,
+                tmp_dir=tmp_dir,
+            )
+        )
+        t1_in_dwi_out = wf.invert_xfm.lzout.t1_in_dwi
 
     # ------------------------------------------------------------------
     # Tensor metrics
@@ -1788,11 +1849,12 @@ def build_dwi_workflow(plan: dict) -> pydra.Workflow:
         copy_final_outputs(
             name="copy_outputs",
             dwi_biascorr_mif=wf.dwi_biascorr.lzout.out,
-            t1_in_dwi=wf.invert_xfm.lzout.t1_in_dwi,
+            t1_in_dwi=t1_in_dwi_out,
             adc_nii=wf.tensor.lzout.adc,
             fa_nii=wf.tensor.lzout.fa,
             out_dir=out_dir,
             dwi_preproc_name=dwi_preproc_name,
+            t1_output_name=t1_output_name,
         )
     )
 
